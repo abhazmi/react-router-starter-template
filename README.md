@@ -107,3 +107,14 @@ This template comes with [Tailwind CSS](https://tailwindcss.com/) already config
 ---
 
 Built with ❤️ using React Router.
+
+## TikTok HD tool (`/`)
+
+The home page is a mobile-first tool (Arabic, RTL) that re-encodes a video on the
+phone before uploading it to TikTok: 1080p / 2K / 4K output in 9:16, constant frame
+rate, H.264 at a high bitrate, and AAC audio. It uses WebCodecs through
+[mediabunny](https://mediabunny.dev), so the work runs on the device's hardware
+encoder and the video is never uploaded to a server. The result can be shared
+straight to TikTok via the Web Share API, or saved.
+
+Logic lives in `app/tiktok/encoder.ts`; the UI is `app/routes/home.tsx`.
