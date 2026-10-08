@@ -117,13 +117,34 @@ export function targetBitrate(preset: Preset, fps: number) {
   return Math.round(preset.bitrate30 * (fps > 30 ? 1.5 : 1));
 }
 
-export function estimateBytes(info: VideoInfo, preset: Preset) {
-  const fps = targetFrameRate(info.fps);
+export type EncodeOptions = {
+  /** Output 60 fps even when the source is slower (frames are repeated). */
+  fps60: boolean;
+  /** Apply the ghost-frame container rewrite (forces H.264). */
+  decoy: boolean;
+};
+
+export function outputFrameRate(info: Pick<VideoInfo, "fps">, opts: Pick<EncodeOptions, "fps60">) {
+  return opts.fps60 ? 60 : targetFrameRate(info.fps);
+}
+
+export function estimateBytes(info: VideoInfo, preset: Preset, opts: Pick<EncodeOptions, "fps60">) {
+  const fps = outputFrameRate(info, opts);
   const audio = info.hasAudio ? AUDIO_BITRATE : 0;
   return ((targetBitrate(preset, fps) + audio) * info.duration) / 8;
 }
 
-export type EncodeResult = { blob: Blob; width: number; height: number; fps: number; codec: string };
+export type EncodeResult = {
+  blob: Blob;
+  width: number;
+  height: number;
+  fps: number;
+  codec: string;
+  /** Declared frame count when the decoy rewrite was applied, otherwise null. */
+  decoyFrames: number | null;
+  /** True when the decoy was requested but couldn't be applied to this file. */
+  decoyFailed: boolean;
+};
 
 export type EncodeJob = {
   promise: Promise<EncodeResult>;
@@ -132,7 +153,7 @@ export type EncodeJob = {
 
 export class EncodeError extends Error {
   constructor(
-    public code: "UNSUPPORTED_SIZE" | "UNDECODABLE" | "INVALID" | "CANCELED",
+    public code: "UNSUPPORTED_SIZE" | "NO_H264" | "UNDECODABLE" | "INVALID" | "CANCELED",
     message?: string,
   ) {
     super(message ?? code);
@@ -143,6 +164,7 @@ export function encodeForTikTok(
   file: File,
   info: VideoInfo,
   preset: Preset,
+  opts: EncodeOptions,
   onProgress: (p: number) => void,
 ): EncodeJob {
   let cancelRequested = false;
@@ -156,19 +178,20 @@ export function encodeForTikTok(
       registerAacEncoder();
     }
     const { width, height } = targetSize(info, preset);
-    const fps = targetFrameRate(info.fps);
+    const fps = outputFrameRate(info, opts);
     const bitrate = targetBitrate(preset, fps);
     const quality = new mb.Quality({ bitrate, bitrateMode: "variable" });
 
     // H.264 is what TikTok handles best; fall back to HEVC, then VP9, if the device can't do it at this size.
+    // The decoy rewrite only works on H.264.
     let codec: "avc" | "hevc" | "vp9" | null = null;
-    for (const c of ["avc", "hevc", "vp9"] as const) {
+    for (const c of opts.decoy ? (["avc"] as const) : (["avc", "hevc", "vp9"] as const)) {
       if (await mb.canEncodeVideo(c, { width, height, quality, frameRate: fps })) {
         codec = c;
         break;
       }
     }
-    if (!codec) throw new EncodeError("UNSUPPORTED_SIZE");
+    if (!codec) throw new EncodeError(opts.decoy ? "NO_H264" : "UNSUPPORTED_SIZE");
     if (cancelRequested) throw new EncodeError("CANCELED");
 
     const input = new mb.Input({ source: new mb.BlobSource(file), formats: mb.ALL_FORMATS });
@@ -225,8 +248,26 @@ export function encodeForTikTok(
 
     const buffer = target.buffer;
     if (!buffer) throw new EncodeError("INVALID", "empty output");
+
+    let bytes: Uint8Array<ArrayBuffer> = new Uint8Array(buffer);
+    let decoyFrames: number | null = null;
+    let decoyFailed = false;
+    if (opts.decoy) {
+      const { applyDecoy } = await import("./decoy");
+      try {
+        const r = applyDecoy(bytes);
+        bytes = r.bytes as Uint8Array<ArrayBuffer>;
+        decoyFrames = r.stats.declaredFrames;
+      } catch (e) {
+        console.error(e);
+        decoyFailed = true;
+      }
+    }
+
     return {
-      blob: new Blob([buffer], { type: "video/mp4" }),
+      decoyFrames,
+      decoyFailed,
+      blob: new Blob([bytes], { type: "video/mp4" }),
       width,
       height,
       fps,

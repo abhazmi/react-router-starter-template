@@ -3,13 +3,13 @@ import type { Route } from "./+types/home";
 import {
   EncodeError,
   PRESETS,
+  outputFrameRate,
   encodeForTikTok,
   estimateBytes,
   formatBytes,
   formatDuration,
   isSupportedBrowser,
   readVideoInfo,
-  targetFrameRate,
   targetSize,
   type EncodeJob,
   type EncodeResult,
@@ -42,6 +42,8 @@ export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [stage, setStage] = useState<Stage>({ kind: "empty" });
   const [presetId, setPresetId] = useState<PresetId>("1080p");
+  const [fps60, setFps60] = useState(true);
+  const [decoy, setDecoy] = useState(true);
   const [now, setNow] = useState(Date.now());
   const jobRef = useRef<EncodeJob | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -85,7 +87,7 @@ export default function Home() {
     const startedAt = Date.now();
     setNow(startedAt);
     setStage({ kind: "encoding", info, progress: 0, startedAt });
-    const job = encodeForTikTok(file, info, preset, (progress) =>
+    const job = encodeForTikTok(file, info, preset, { fps60, decoy }, (progress) =>
       setStage((s) => (s.kind === "encoding" ? { ...s, progress } : s)),
     );
     jobRef.current = job;
@@ -108,6 +110,10 @@ export default function Home() {
       const message =
         code === "UNSUPPORTED_SIZE"
           ? `جوالك ما يدعم التحويل بدقة ${preset.label}. اختر دقة أقل وجرّب مرة ثانية.`
+          : code === "NO_H264"
+            ? preset.id === "1080p"
+              ? "وضع Decoy يحتاج H.264، والمتصفح هذا ما يدعمه. افتح الصفحة في Safari (آيفون) أو Chrome (أندرويد)، أو طفّ وضع Decoy."
+              : `وضع Decoy يحتاج H.264، وجوالك ما يدعمه بدقة ${preset.label}. اختر 1080p أو طفّ وضع Decoy.`
           : code === "UNDECODABLE"
             ? "المتصفح هذا ما يقدر يقرأ صيغة الفيديو. افتح الصفحة في Safari (آيفون) أو Chrome (أندرويد) وجرّب مرة ثانية."
             : "صار خطأ أثناء التحويل. جرّب دقة أقل، أو أغلق التطبيقات الثانية وحاول مرة ثانية.";
@@ -245,16 +251,35 @@ export default function Home() {
                   {info && size && (
                     <span className="text-left text-xs text-white/60" dir="ltr">
                       {size.width}×{size.height}
-                      <br />≈ {formatBytes(estimateBytes(info, p))}
+                      <br />≈ {formatBytes(estimateBytes(info, p, { fps60 }))}
                     </span>
                   )}
                 </label>
               );
             })}
           </div>
+          <div className="mt-4 grid gap-2">
+            <Toggle
+              id="fps60"
+              checked={fps60}
+              disabled={busy}
+              onChange={setFps60}
+              title="60 فريم"
+              hint="يطلع الفيديو 60fps حتى لو مصوّر 30، عشان تيك توك يعطيه جودة 1080p60."
+            />
+            <Toggle
+              id="decoy"
+              checked={decoy}
+              disabled={busy}
+              onChange={setDecoy}
+              title="وضع Decoy"
+              hint="يعدّل بيانات الملف بحيث يبيّن إن فيه فريمات أكثر، وهي نفس الطريقة اللي تستخدمها أدوات Decoy 60fps. الصورة نفسها ما تتغير. هذي حيلة غير رسمية، ممكن تيك توك يوقفها أو يعتبرها مخالفة."
+            />
+          </div>
           {info && (
             <p className="mt-3 text-xs text-white/50">
-              الإخراج: H.264 · {targetFrameRate(info.fps)} fps ثابت · صوت AAC 320kbps
+              الإخراج: H.264 · {outputFrameRate(info, { fps60 })} fps ثابت · صوت AAC
+              {decoy && " · Decoy ×10"}
             </p>
           )}
         </Card>
@@ -323,26 +348,38 @@ export default function Home() {
               {stage.result.codec} · {formatBytes(stage.result.blob.size)} ·{" "}
               {formatDuration(stage.seconds)}
             </p>
+            {stage.result.decoyFrames !== null && (
+              <p className="mt-2 text-center text-xs text-[#25f4ee]">
+                Decoy مفعّل: الملف يبيّن {stage.result.decoyFrames.toLocaleString("en")} فريم
+              </p>
+            )}
+            {stage.result.decoyFailed && (
+              <p className="mt-2 rounded-lg bg-yellow-400/10 p-2 text-center text-xs text-yellow-200">
+                ما قدرنا نطبّق Decoy على هذا الملف، فطلع بالتحويل العادي.
+              </p>
+            )}
             <div className="mt-4 grid gap-2">
-              {canShareFiles && (
+              {canShareFiles ? (
                 <button
                   type="button"
                   onClick={() => void share()}
                   className="rounded-xl bg-white py-4 text-lg font-bold text-black active:scale-[0.99]"
                 >
-                  مشاركة ← اختر TikTok
+                  مشاركة مباشرة لتيك توك
                 </button>
+              ) : (
+                <a
+                  href={stage.url}
+                  download={outputName}
+                  className="rounded-xl bg-white py-4 text-center text-lg font-bold text-black"
+                >
+                  حفظ الفيديو
+                </a>
               )}
-              <a
-                href={stage.url}
-                download={outputName}
-                className="rounded-xl border border-white/20 py-3 text-center font-semibold"
-              >
-                حفظ الفيديو في الجوال
-              </a>
             </div>
             <p className="mt-3 text-xs leading-relaxed text-white/50">
-              في الآيفون: اضغط «مشاركة» ثم «حفظ الفيديو» عشان ينحفظ في الصور، أو اختر TikTok مباشرة.
+              اضغط الزر واختر <b>TikTok</b> من قائمة المشاركة، والفيديو يروح للتطبيق مباشرة بدون ما
+              ينحفظ في الجوال.
             </p>
           </Card>
         )}
@@ -365,13 +402,52 @@ export default function Home() {
             </li>
             <li>صوّر بأعلى دقة عندك (4K أو 1080p) و30 أو 60 فريم، وبإضاءة كويسة.</li>
             <li>
-              إذا الملف كبير والتطبيق رفضه، ارفعه من موقع تيك توك على المتصفح (tiktok.com/upload) أو
-              اختر دقة أقل.
+              إذا الجودة ما زالت ضعيفة من التطبيق، ارفع من موقع تيك توك في المتصفح
+              (tiktok.com/tiktokstudio/upload). أدوات Decoy تعتمد على الرفع من الموقع، لأن تطبيق
+              الجوال أحيانًا يعيد ضغط الفيديو قبل ما يرفعه.
             </li>
           </ol>
         </Card>
       </div>
     </main>
+  );
+}
+
+function Toggle({
+  id,
+  checked,
+  disabled,
+  onChange,
+  title,
+  hint,
+}: {
+  id: string;
+  checked: boolean;
+  disabled?: boolean;
+  onChange: (v: boolean) => void;
+  title: string;
+  hint: string;
+}) {
+  return (
+    <label
+      htmlFor={id}
+      className={`flex cursor-pointer items-start gap-3 rounded-xl border p-3 transition ${
+        checked ? "border-[#fe2c55] bg-[#fe2c55]/10" : "border-white/10"
+      }`}
+    >
+      <input
+        id={id}
+        type="checkbox"
+        checked={checked}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.checked)}
+        className="mt-1 h-5 w-5 accent-[#fe2c55]"
+      />
+      <span className="flex-1">
+        <span className="block font-semibold">{title}</span>
+        <span className="block text-xs leading-relaxed text-white/55">{hint}</span>
+      </span>
+    </label>
   );
 }
 
