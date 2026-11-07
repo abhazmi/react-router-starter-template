@@ -113,29 +113,43 @@ export function targetSize(info: Pick<VideoInfo, "width" | "height">, preset: Pr
   return { width: even(info.width * scale), height: even(info.height * scale) };
 }
 
-export function targetBitrate(preset: Preset, fps: number) {
-  return Math.round(preset.bitrate30 * (fps > 30 ? 1.5 : 1));
+/** Constant bitrate used by the 7-u8 toolkit's upload spec (1080p H.264, 50 Mbps CBR). */
+export const CBR_BITRATE = 50_000_000;
+
+export function targetBitrate(preset: Preset, fps: number, cbr = false) {
+  const vbr = Math.round(preset.bitrate30 * (fps > 30 ? 1.5 : 1));
+  return cbr ? Math.max(vbr, CBR_BITRATE) : vbr;
 }
+
+export type Method = "timescale" | "silent" | "audio" | "frames" | "none";
 
 export type EncodeOptions = {
   /** Output 60 fps even when the source is slower (frames are repeated). */
   fps60: boolean;
+  /** Encode at a constant 50 Mbps (or the preset's rate, if higher) instead of variable bitrate. */
+  cbr: boolean;
   /**
-   * Container rewrite applied after encoding (both force H.264):
-   * "audio" = duplicated audio track with inflated sample tables (newer method),
+   * Container rewrite applied after encoding (all of them force H.264):
+   * "timescale" = mvhd/mdhd timing scaled to 30 fps ("120 FPS method", Oct 2026),
+   * "silent" = interleave + fake samples outside stts (Silent Method, Nov 2026),
+   * "audio" = duplicated audio track with inflated sample tables (Sept 2026),
    * "frames" = ghost video frames (older method), "none" = plain file.
    */
-  method: "audio" | "frames" | "none";
+  method: Method;
 };
 
 export function outputFrameRate(info: Pick<VideoInfo, "fps">, opts: Pick<EncodeOptions, "fps60">) {
   return opts.fps60 ? 60 : targetFrameRate(info.fps);
 }
 
-export function estimateBytes(info: VideoInfo, preset: Preset, opts: Pick<EncodeOptions, "fps60">) {
+export function estimateBytes(
+  info: VideoInfo,
+  preset: Preset,
+  opts: Pick<EncodeOptions, "fps60" | "cbr">,
+) {
   const fps = outputFrameRate(info, opts);
   const audio = info.hasAudio ? AUDIO_BITRATE : 0;
-  return ((targetBitrate(preset, fps) + audio) * info.duration) / 8;
+  return ((targetBitrate(preset, fps, opts.cbr) + audio) * info.duration) / 8;
 }
 
 export type EncodeResult = {
@@ -145,7 +159,9 @@ export type EncodeResult = {
   fps: number;
   codec: string;
   /** The rewrite that was actually applied. */
-  applied: "audio" | "frames" | "none";
+  applied: Method;
+  /** Whether the 50 Mbps constant bitrate was used (false when the device fell back to VBR). */
+  cbr: boolean;
   /** True when a rewrite was requested but couldn't be applied to this file. */
   rewriteFailed: boolean;
 };
@@ -183,18 +199,28 @@ export function encodeForTikTok(
     }
     const { width, height } = targetSize(info, preset);
     const fps = outputFrameRate(info, opts);
-    const bitrate = targetBitrate(preset, fps);
-    const quality = new mb.Quality({ bitrate, bitrateMode: "variable" });
+    // Prefer the requested rate control; if the device can't do 50 Mbps CBR, use the preset VBR.
+    const qualities = [
+      ...(opts.cbr
+        ? [new mb.Quality({ bitrate: targetBitrate(preset, fps, true), bitrateMode: "constant" })]
+        : []),
+      new mb.Quality({ bitrate: targetBitrate(preset, fps), bitrateMode: "variable" }),
+    ];
 
     // H.264 is what TikTok handles best; fall back to HEVC, then VP9, if the device can't do it at this size.
     // The container rewrites only work on H.264.
     let codec: "avc" | "hevc" | "vp9" | null = null;
-    for (const c of opts.method !== "none" ? (["avc"] as const) : (["avc", "hevc", "vp9"] as const)) {
-      if (await mb.canEncodeVideo(c, { width, height, quality, frameRate: fps })) {
-        codec = c;
-        break;
+    let quality = qualities[0];
+    search: for (const q of qualities) {
+      for (const c of opts.method !== "none" ? (["avc"] as const) : (["avc", "hevc", "vp9"] as const)) {
+        if (await mb.canEncodeVideo(c, { width, height, quality: q, frameRate: fps })) {
+          codec = c;
+          quality = q;
+          break search;
+        }
       }
     }
+    const usedCbr = opts.cbr && quality === qualities[0];
     if (!codec) throw new EncodeError(opts.method !== "none" ? "NO_H264" : "UNSUPPORTED_SIZE");
     if (cancelRequested) throw new EncodeError("CANCELED");
 
@@ -257,12 +283,18 @@ export function encodeForTikTok(
     let bytes: Uint8Array<ArrayBuffer> = new Uint8Array(buffer);
     let applied: EncodeResult["applied"] = "none";
     let rewriteFailed = false;
-    // The audio method needs an audio track; without one, fall back to ghost frames.
-    const method = opts.method === "audio" && !info.hasAudio ? "frames" : opts.method;
+    // Each rewrite has a precondition; when it isn't met, use the closest one that applies.
+    let method = opts.method;
+    if (method === "timescale" && fps <= 30) method = "silent";
+    if (method === "audio" && !info.hasAudio) method = "frames";
     if (method !== "none") {
-      const { applyAudioClone, applyDecoy } = await import("./decoy");
+      const m = await import("./decoy");
       try {
-        const r = method === "audio" ? applyAudioClone(bytes) : applyDecoy(bytes);
+        const r =
+          method === "timescale" ? m.applyTimescale(bytes, fps, 30)
+          : method === "silent" ? m.applySilent(bytes)
+          : method === "audio" ? m.applyAudioClone(bytes)
+          : m.applyDecoy(bytes);
         bytes = r.bytes as Uint8Array<ArrayBuffer>;
         applied = method;
       } catch (e) {
@@ -274,6 +306,7 @@ export function encodeForTikTok(
     return {
       applied,
       rewriteFailed,
+      cbr: usedCbr,
       blob: new Blob([bytes], { type: "video/mp4" }),
       width,
       height,

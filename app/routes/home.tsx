@@ -44,7 +44,8 @@ export default function Home() {
   const [stage, setStage] = useState<Stage>({ kind: "empty" });
   const [presetId, setPresetId] = useState<PresetId>("1080p");
   const [fps60, setFps60] = useState(true);
-  const [method, setMethod] = useState<EncodeOptions["method"]>("audio");
+  const [method, setMethod] = useState<EncodeOptions["method"]>("timescale");
+  const [cbr, setCbr] = useState(true);
   const [now, setNow] = useState(Date.now());
   const jobRef = useRef<EncodeJob | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -88,7 +89,7 @@ export default function Home() {
     const startedAt = Date.now();
     setNow(startedAt);
     setStage({ kind: "encoding", info, progress: 0, startedAt });
-    const job = encodeForTikTok(file, info, preset, { fps60, method }, (progress) =>
+    const job = encodeForTikTok(file, info, preset, { fps60, cbr, method }, (progress) =>
       setStage((s) => (s.kind === "encoding" ? { ...s, progress } : s)),
     );
     jobRef.current = job;
@@ -252,7 +253,7 @@ export default function Home() {
                   {info && size && (
                     <span className="text-left text-xs text-white/60" dir="ltr">
                       {size.width}×{size.height}
-                      <br />≈ {formatBytes(estimateBytes(info, p, { fps60 }))}
+                      <br />≈ {formatBytes(estimateBytes(info, p, { fps60, cbr }))}
                     </span>
                   )}
                 </label>
@@ -267,6 +268,14 @@ export default function Home() {
               onChange={setFps60}
               title="60 فريم"
               hint="يطلع الفيديو 60fps حتى لو مصوّر 30، عشان تيك توك يعطيه جودة 1080p60."
+            />
+            <Toggle
+              id="cbr"
+              checked={cbr}
+              disabled={busy}
+              onChange={setCbr}
+              title="معدل بت ثابت 50 ميجابت"
+              hint="نفس مواصفات الرفع في أداة أبو شداد (7-u8). يكبّر حجم الملف، بس يعطي تيك توك تفاصيل أكثر."
             />
             <fieldset className="grid gap-2 rounded-xl border border-white/10 p-3">
               <legend className="px-1 font-semibold">طريقة الحماية من الضغط</legend>
@@ -295,7 +304,8 @@ export default function Home() {
           </div>
           {info && (
             <p className="mt-3 text-xs text-white/50">
-              الإخراج: H.264 · {outputFrameRate(info, { fps60 })} fps ثابت · صوت AAC
+              الإخراج: H.264 · {outputFrameRate(info, { fps60 })} fps ثابت
+              {cbr && " · 50 Mbps CBR"} · صوت AAC
               {method !== "none" && ` · ${METHODS.find((m) => m.id === method)!.short}`}
             </p>
           )}
@@ -362,7 +372,8 @@ export default function Home() {
             />
             <p className="mt-3 text-center text-xs text-white/60" dir="ltr">
               {stage.result.width}×{stage.result.height} · {stage.result.fps} fps ·{" "}
-              {stage.result.codec} · {formatBytes(stage.result.blob.size)} ·{" "}
+              {stage.result.codec}
+              {stage.result.cbr && " CBR"} · {formatBytes(stage.result.blob.size)} ·{" "}
               {formatDuration(stage.seconds)}
             </p>
             {stage.result.applied !== "none" && (
@@ -457,10 +468,22 @@ export default function Home() {
 
 const METHODS: { id: EncodeOptions["method"]; title: string; short: string; hint: string }[] = [
   {
+    id: "timescale",
+    title: "تعديل التوقيت «120 FPS» (الأكثر استخدامًا)",
+    short: "توقيت 30fps",
+    hint: "يعدّل أرقام التوقيت في رأس الملف بس، بدون بيانات وهمية ولا تغيير في المدة. تستخدمه أداة أبو شداد وH4B وrealbay من أكتوبر 2026. يحتاج 60 فريم.",
+  },
+  {
+    id: "silent",
+    title: "Silent Method (الأحدث، نوفمبر 2026)",
+    short: "Silent",
+    hint: "يرتّب الصوت والصورة، ويضيف عينات وهمية ما تأثر على المدة، ويمسح بيانات برامج المونتاج.",
+  },
+  {
     id: "audio",
-    title: "نسخ الصوت (الأحدث)",
+    title: "نسخ الصوت (سبتمبر 2026)",
     short: "نسخ الصوت",
-    hint: "يضيف نسخة ثانية من مسار الصوت ببيانات مضخّمة. هذي الطريقة اللي تستخدمها الأدوات من سبتمبر 2026.",
+    hint: "يضيف نسخة ثانية من مسار الصوت ببيانات مضخّمة.",
   },
   {
     id: "frames",
