@@ -12,6 +12,7 @@ import {
   readVideoInfo,
   targetSize,
   type EncodeJob,
+  type EncodeOptions,
   type EncodeResult,
   type PresetId,
   type VideoInfo,
@@ -43,7 +44,7 @@ export default function Home() {
   const [stage, setStage] = useState<Stage>({ kind: "empty" });
   const [presetId, setPresetId] = useState<PresetId>("1080p");
   const [fps60, setFps60] = useState(true);
-  const [decoy, setDecoy] = useState(true);
+  const [method, setMethod] = useState<EncodeOptions["method"]>("audio");
   const [now, setNow] = useState(Date.now());
   const jobRef = useRef<EncodeJob | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -87,7 +88,7 @@ export default function Home() {
     const startedAt = Date.now();
     setNow(startedAt);
     setStage({ kind: "encoding", info, progress: 0, startedAt });
-    const job = encodeForTikTok(file, info, preset, { fps60, decoy }, (progress) =>
+    const job = encodeForTikTok(file, info, preset, { fps60, method }, (progress) =>
       setStage((s) => (s.kind === "encoding" ? { ...s, progress } : s)),
     );
     jobRef.current = job;
@@ -112,8 +113,8 @@ export default function Home() {
           ? `جوالك ما يدعم التحويل بدقة ${preset.label}. اختر دقة أقل وجرّب مرة ثانية.`
           : code === "NO_H264"
             ? preset.id === "1080p"
-              ? "وضع Decoy يحتاج H.264، والمتصفح هذا ما يدعمه. افتح الصفحة في Safari (آيفون) أو Chrome (أندرويد)، أو طفّ وضع Decoy."
-              : `وضع Decoy يحتاج H.264، وجوالك ما يدعمه بدقة ${preset.label}. اختر 1080p أو طفّ وضع Decoy.`
+              ? "طريقة الحماية من الضغط تحتاج H.264، والمتصفح هذا ما يدعمه. افتح الصفحة في Chrome أو Safari، أو اختر «بدون»."
+              : `طريقة الحماية من الضغط تحتاج H.264، وجهازك ما يدعمه بدقة ${preset.label}. اختر 1080p أو اختر «بدون».`
           : code === "UNDECODABLE"
             ? "المتصفح هذا ما يقدر يقرأ صيغة الفيديو. افتح الصفحة في Safari (آيفون) أو Chrome (أندرويد) وجرّب مرة ثانية."
             : "صار خطأ أثناء التحويل. جرّب دقة أقل، أو أغلق التطبيقات الثانية وحاول مرة ثانية.";
@@ -152,16 +153,16 @@ export default function Home() {
           </div>
           <h1 className="text-2xl font-extrabold">تيك توك بجودة عالية</h1>
           <p className="mt-2 text-sm leading-relaxed text-white/60">
-            حوّل الفيديو لأفضل إعدادات للرفع على تيك توك، وبعدها شاركه مباشرة للتطبيق.
-            كل شي يتم على جوالك، الفيديو ما يترفع لأي سيرفر.
+            حوّل الفيديو لأفضل إعدادات للرفع على تيك توك، وبعدها ارفعه من موقع تيك توك.
+            كل شي يتم على جهازك، الفيديو ما يترفع لأي سيرفر.
           </p>
         </header>
 
         {supported === false && (
           <Card className="border-[#fe2c55]/50">
             <p className="text-sm leading-relaxed">
-              المتصفح الحالي ما يدعم تحويل الفيديو. افتح الصفحة في <b>Safari</b> (آيفون iOS 16.4
-              أو أحدث) أو <b>Chrome</b> (أندرويد)، مو من داخل متصفح تطبيق ثاني.
+              المتصفح الحالي ما يدعم تحويل الفيديو. افتح الصفحة في <b>Chrome</b> أو <b>Safari</b>{" "}
+              (آيفون iOS 16.4 أو أحدث)، مو من داخل متصفح تطبيق ثاني.
             </p>
           </Card>
         )}
@@ -267,19 +268,35 @@ export default function Home() {
               title="60 فريم"
               hint="يطلع الفيديو 60fps حتى لو مصوّر 30، عشان تيك توك يعطيه جودة 1080p60."
             />
-            <Toggle
-              id="decoy"
-              checked={decoy}
-              disabled={busy}
-              onChange={setDecoy}
-              title="وضع Decoy"
-              hint="يعدّل بيانات الملف بحيث يبيّن إن فيه فريمات أكثر، وهي نفس الطريقة اللي تستخدمها أدوات Decoy 60fps. الصورة نفسها ما تتغير. هذي حيلة غير رسمية، ممكن تيك توك يوقفها أو يعتبرها مخالفة."
-            />
+            <fieldset className="grid gap-2 rounded-xl border border-white/10 p-3">
+              <legend className="px-1 font-semibold">طريقة الحماية من الضغط</legend>
+              {METHODS.map((m) => (
+                <label key={m.id} className="flex cursor-pointer items-start gap-3">
+                  <input
+                    type="radio"
+                    name="method"
+                    value={m.id}
+                    checked={method === m.id}
+                    disabled={busy}
+                    onChange={() => setMethod(m.id)}
+                    className="mt-1 accent-[#fe2c55]"
+                  />
+                  <span className="flex-1">
+                    <span className="block text-sm font-semibold">{m.title}</span>
+                    <span className="block text-xs leading-relaxed text-white/55">{m.hint}</span>
+                  </span>
+                </label>
+              ))}
+              <p className="text-[11px] leading-relaxed text-white/45">
+                هذي حيل غير رسمية تعدّل بيانات الملف بس، والصورة نفسها ما تتغير. ممكن تيك توك يوقفها
+                في أي وقت، أو يعتبرها مخالفة. جرّبها بنشر خاص أول.
+              </p>
+            </fieldset>
           </div>
           {info && (
             <p className="mt-3 text-xs text-white/50">
               الإخراج: H.264 · {outputFrameRate(info, { fps60 })} fps ثابت · صوت AAC
-              {decoy && " · Decoy ×10"}
+              {method !== "none" && ` · ${METHODS.find((m) => m.id === method)!.short}`}
             </p>
           )}
         </Card>
@@ -348,24 +365,43 @@ export default function Home() {
               {stage.result.codec} · {formatBytes(stage.result.blob.size)} ·{" "}
               {formatDuration(stage.seconds)}
             </p>
-            {stage.result.decoyFrames !== null && (
+            {stage.result.applied !== "none" && (
               <p className="mt-2 text-center text-xs text-[#25f4ee]">
-                Decoy مفعّل: الملف يبيّن {stage.result.decoyFrames.toLocaleString("en")} فريم
+                تم تطبيق: {METHODS.find((m) => m.id === stage.result.applied)!.title}
               </p>
             )}
-            {stage.result.decoyFailed && (
+            {stage.result.rewriteFailed && (
               <p className="mt-2 rounded-lg bg-yellow-400/10 p-2 text-center text-xs text-yellow-200">
-                ما قدرنا نطبّق Decoy على هذا الملف، فطلع بالتحويل العادي.
+                ما قدرنا نطبّق طريقة الحماية على هذا الملف، فطلع بالتحويل العادي.
               </p>
             )}
-            <div className="mt-4 grid gap-2">
+
+            <div className="mt-4 rounded-xl bg-[#fe2c55]/10 p-3 text-sm leading-relaxed">
+              <p className="font-bold">لا تشاركه لتطبيق تيك توك</p>
+              <p className="mt-1 text-white/75">
+                التطبيق يضغط الفيديو في جهازك قبل ما يرفعه، ويمسح التعديلات. ارفعه من موقع تيك توك:
+              </p>
+              <ol className="mt-2 list-decimal space-y-1 ps-5 text-white/85">
+                <li>
+                  احفظ الفيديو
+                  {canShareFiles && " (اختر «حفظ في الملفات» من قائمة المشاركة)"}.
+                </li>
+                <li>
+                  افتح <b dir="ltr">tiktok.com/tiktokstudio/upload</b>. على الآيفون: Safari ← زر «aA»
+                  ← «طلب موقع سطح المكتب».
+                </li>
+                <li>ارفع الملف، وفعّل «Upload HD / جودة عالية» قبل النشر.</li>
+              </ol>
+            </div>
+
+            <div className="mt-3 grid gap-2">
               {canShareFiles ? (
                 <button
                   type="button"
                   onClick={() => void share()}
                   className="rounded-xl bg-white py-4 text-lg font-bold text-black active:scale-[0.99]"
                 >
-                  مشاركة مباشرة لتيك توك
+                  حفظ الفيديو
                 </button>
               ) : (
                 <a
@@ -376,11 +412,15 @@ export default function Home() {
                   حفظ الفيديو
                 </a>
               )}
+              <a
+                href="https://www.tiktok.com/tiktokstudio/upload"
+                target="_blank"
+                rel="noreferrer"
+                className="rounded-xl border border-white/20 py-3 text-center font-semibold"
+              >
+                فتح صفحة الرفع في تيك توك
+              </a>
             </div>
-            <p className="mt-3 text-xs leading-relaxed text-white/50">
-              اضغط الزر واختر <b>TikTok</b> من قائمة المشاركة، والفيديو يروح للتطبيق مباشرة بدون ما
-              ينحفظ في الجوال.
-            </p>
           </Card>
         )}
 
@@ -402,9 +442,11 @@ export default function Home() {
             </li>
             <li>صوّر بأعلى دقة عندك (4K أو 1080p) و30 أو 60 فريم، وبإضاءة كويسة.</li>
             <li>
-              إذا الجودة ما زالت ضعيفة من التطبيق، ارفع من موقع تيك توك في المتصفح
-              (tiktok.com/tiktokstudio/upload). أدوات Decoy تعتمد على الرفع من الموقع، لأن تطبيق
-              الجوال أحيانًا يعيد ضغط الفيديو قبل ما يرفعه.
+              الأفضل ترفع من الكمبيوتر من موقع تيك توك. من الجوال، استخدم Safari بوضع «موقع سطح
+              المكتب» بدل التطبيق.
+            </li>
+            <li>
+              تيك توك أحيانًا يعرض نسخة ضعيفة أول كم ساعة بعد النشر، لين يخلص يجهّز النسخة العالية.
             </li>
           </ol>
         </Card>
@@ -412,6 +454,22 @@ export default function Home() {
     </main>
   );
 }
+
+const METHODS: { id: EncodeOptions["method"]; title: string; short: string; hint: string }[] = [
+  {
+    id: "audio",
+    title: "نسخ الصوت (الأحدث)",
+    short: "نسخ الصوت",
+    hint: "يضيف نسخة ثانية من مسار الصوت ببيانات مضخّمة. هذي الطريقة اللي تستخدمها الأدوات من سبتمبر 2026.",
+  },
+  {
+    id: "frames",
+    title: "فريمات وهمية (Decoy القديمة)",
+    short: "Decoy ×10",
+    hint: "يخلي الملف يبيّن إن فيه فريمات أكثر بعشر مرات. يقال إن تيك توك قفلها.",
+  },
+  { id: "none", title: "بدون", short: "", hint: "تحويل بجودة عالية بس، بدون أي تعديل على الملف." },
+];
 
 function Toggle({
   id,

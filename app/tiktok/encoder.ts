@@ -120,8 +120,12 @@ export function targetBitrate(preset: Preset, fps: number) {
 export type EncodeOptions = {
   /** Output 60 fps even when the source is slower (frames are repeated). */
   fps60: boolean;
-  /** Apply the ghost-frame container rewrite (forces H.264). */
-  decoy: boolean;
+  /**
+   * Container rewrite applied after encoding (both force H.264):
+   * "audio" = duplicated audio track with inflated sample tables (newer method),
+   * "frames" = ghost video frames (older method), "none" = plain file.
+   */
+  method: "audio" | "frames" | "none";
 };
 
 export function outputFrameRate(info: Pick<VideoInfo, "fps">, opts: Pick<EncodeOptions, "fps60">) {
@@ -140,10 +144,10 @@ export type EncodeResult = {
   height: number;
   fps: number;
   codec: string;
-  /** Declared frame count when the decoy rewrite was applied, otherwise null. */
-  decoyFrames: number | null;
-  /** True when the decoy was requested but couldn't be applied to this file. */
-  decoyFailed: boolean;
+  /** The rewrite that was actually applied. */
+  applied: "audio" | "frames" | "none";
+  /** True when a rewrite was requested but couldn't be applied to this file. */
+  rewriteFailed: boolean;
 };
 
 export type EncodeJob = {
@@ -183,15 +187,15 @@ export function encodeForTikTok(
     const quality = new mb.Quality({ bitrate, bitrateMode: "variable" });
 
     // H.264 is what TikTok handles best; fall back to HEVC, then VP9, if the device can't do it at this size.
-    // The decoy rewrite only works on H.264.
+    // The container rewrites only work on H.264.
     let codec: "avc" | "hevc" | "vp9" | null = null;
-    for (const c of opts.decoy ? (["avc"] as const) : (["avc", "hevc", "vp9"] as const)) {
+    for (const c of opts.method !== "none" ? (["avc"] as const) : (["avc", "hevc", "vp9"] as const)) {
       if (await mb.canEncodeVideo(c, { width, height, quality, frameRate: fps })) {
         codec = c;
         break;
       }
     }
-    if (!codec) throw new EncodeError(opts.decoy ? "NO_H264" : "UNSUPPORTED_SIZE");
+    if (!codec) throw new EncodeError(opts.method !== "none" ? "NO_H264" : "UNSUPPORTED_SIZE");
     if (cancelRequested) throw new EncodeError("CANCELED");
 
     const input = new mb.Input({ source: new mb.BlobSource(file), formats: mb.ALL_FORMATS });
@@ -213,7 +217,8 @@ export function encodeForTikTok(
           frameRate: fps,
           codec,
           quality,
-          keyFrameInterval: 2,
+          // Long GOP like the reference tool (keyframes roughly every 9 s).
+          keyFrameInterval: opts.method === "audio" ? 9.1 : 2,
           forceTranscode: true,
           // Bake rotation into the pixels so every app shows it upright.
           allowTransformationMetadata: false,
@@ -250,23 +255,25 @@ export function encodeForTikTok(
     if (!buffer) throw new EncodeError("INVALID", "empty output");
 
     let bytes: Uint8Array<ArrayBuffer> = new Uint8Array(buffer);
-    let decoyFrames: number | null = null;
-    let decoyFailed = false;
-    if (opts.decoy) {
-      const { applyDecoy } = await import("./decoy");
+    let applied: EncodeResult["applied"] = "none";
+    let rewriteFailed = false;
+    // The audio method needs an audio track; without one, fall back to ghost frames.
+    const method = opts.method === "audio" && !info.hasAudio ? "frames" : opts.method;
+    if (method !== "none") {
+      const { applyAudioClone, applyDecoy } = await import("./decoy");
       try {
-        const r = applyDecoy(bytes);
+        const r = method === "audio" ? applyAudioClone(bytes) : applyDecoy(bytes);
         bytes = r.bytes as Uint8Array<ArrayBuffer>;
-        decoyFrames = r.stats.declaredFrames;
+        applied = method;
       } catch (e) {
         console.error(e);
-        decoyFailed = true;
+        rewriteFailed = true;
       }
     }
 
     return {
-      decoyFrames,
-      decoyFailed,
+      applied,
+      rewriteFailed,
       blob: new Blob([bytes], { type: "video/mp4" }),
       width,
       height,
