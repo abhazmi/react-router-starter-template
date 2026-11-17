@@ -1,30 +1,26 @@
 import { useEffect, useRef, useState } from "react";
 import type { Route } from "./+types/home";
 import {
-  EncodeError,
-  PRESETS,
-  outputFrameRate,
-  encodeForTikTok,
-  estimateBytes,
+  PrepareError,
+  canMakeLight,
+  codecName,
   formatBytes,
   formatDuration,
-  isSupportedBrowser,
+  maxEligibility,
+  prepareForTikTok,
   readVideoInfo,
-  targetSize,
-  type EncodeJob,
-  type EncodeOptions,
-  type EncodeResult,
-  type PresetId,
+  type Job,
+  type Result,
   type VideoInfo,
 } from "../tiktok/encoder";
 
 export function meta({}: Route.MetaArgs) {
   return [
-    { title: "تيك توك HD — رفع الفيديو بأعلى جودة" },
+    { title: "تيك توك HD — جهّز مقطعك بأعلى جودة" },
     {
       name: "description",
       content:
-        "حوّل فيديوك من الجوال لإعدادات الجودة العالية المناسبة لتيك توك قبل الرفع. كل المعالجة تتم على جهازك.",
+        "جهّز مقطعك لتيك توك من المتصفح بدون إعادة ترميز: نفس الدقة والفريمات وألوان HDR. كل المعالجة على جهازك.",
     },
     { name: "theme-color", content: "#0b0b10" },
   ];
@@ -34,26 +30,31 @@ type Stage =
   | { kind: "empty" }
   | { kind: "reading" }
   | { kind: "ready"; info: VideoInfo }
-  | { kind: "encoding"; info: VideoInfo; progress: number; startedAt: number }
-  | { kind: "done"; info: VideoInfo; result: EncodeResult; url: string; seconds: number }
+  | { kind: "working"; info: VideoInfo; progress: number; startedAt: number }
+  | { kind: "done"; info: VideoInfo; result: Result; url: string; seconds: number }
   | { kind: "error"; message: string; info?: VideoInfo };
 
+type Device = "iphone" | "android" | "computer";
+
 export default function Home() {
-  const [supported, setSupported] = useState<boolean | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [stage, setStage] = useState<Stage>({ kind: "empty" });
-  const [presetId, setPresetId] = useState<PresetId>("original");
-  const [fps60, setFps60] = useState(true);
-  const [method, setMethod] = useState<EncodeOptions["method"]>("timescale");
-  const [cbr, setCbr] = useState(true);
+  const [light, setLight] = useState(false);
+  const [mute, setMute] = useState(false);
+  const [lightSupported, setLightSupported] = useState(true);
+  const [device, setDevice] = useState<Device>("iphone");
   const [now, setNow] = useState(Date.now());
-  const jobRef = useRef<EncodeJob | null>(null);
+  const jobRef = useRef<Job | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => setSupported(isSupportedBrowser()), []);
+  useEffect(() => {
+    setLightSupported(canMakeLight());
+    const ua = navigator.userAgent;
+    setDevice(/iPhone|iPad/.test(ua) ? "iphone" : /Android/.test(ua) ? "android" : "computer");
+  }, []);
 
   useEffect(() => {
-    if (stage.kind !== "encoding") return;
+    if (stage.kind !== "working") return;
     const t = setInterval(() => setNow(Date.now()), 500);
     return () => clearInterval(t);
   }, [stage.kind]);
@@ -63,34 +64,32 @@ export default function Home() {
     return () => URL.revokeObjectURL(stage.url);
   }, [stage]);
 
-  const preset = PRESETS.find((p) => p.id === presetId)!;
-
   async function pickFile(f: File | undefined) {
     if (!f) return;
     jobRef.current?.cancel();
     setFile(f);
     setStage({ kind: "reading" });
     try {
-      const info = await readVideoInfo(f);
-      setStage({ kind: "ready", info });
+      setStage({ kind: "ready", info: await readVideoInfo(f) });
     } catch (e) {
       console.error(e);
-      setStage({
-        kind: "error",
-        message: "ما قدرنا نقرأ هذا الملف. جرّب فيديو بصيغة MP4 أو MOV.",
-      });
+      setStage({ kind: "error", message: "ما قدرنا نقرأ هذا الملف. جرّب مقطع MP4 أو MOV أصلي." });
     }
   }
 
+  const info = "info" in stage ? stage.info : undefined;
+  const eligibility = info ? maxEligibility(info) : null;
+  const mode = light ? "light" : "max";
+  const busy = stage.kind === "reading" || stage.kind === "working";
+  const canStart = !!info && !busy && (light ? lightSupported : eligibility?.ok);
+
   async function start() {
-    if (!file || (stage.kind !== "ready" && stage.kind !== "done" && stage.kind !== "error")) return;
-    const info = stage.info;
-    if (!info) return;
+    if (!file || !info) return;
     const startedAt = Date.now();
     setNow(startedAt);
-    setStage({ kind: "encoding", info, progress: 0, startedAt });
-    const job = encodeForTikTok(file, info, preset, { fps60, cbr, method }, (progress) =>
-      setStage((s) => (s.kind === "encoding" ? { ...s, progress } : s)),
+    setStage({ kind: "working", info, progress: 0, startedAt });
+    const job = prepareForTikTok(file, info, mode, { mute }, (progress) =>
+      setStage((s) => (s.kind === "working" ? { ...s, progress } : s)),
     );
     jobRef.current = job;
     try {
@@ -104,21 +103,18 @@ export default function Home() {
       });
     } catch (e) {
       console.error(e);
-      if (e instanceof EncodeError && e.code === "CANCELED") {
-        setStage({ kind: "ready", info });
-        return;
-      }
-      const code = e instanceof EncodeError ? e.code : null;
+      const code = e instanceof PrepareError ? e.code : null;
+      if (code === "CANCELED") return setStage({ kind: "ready", info });
       const message =
-        code === "UNSUPPORTED_SIZE"
-          ? `جوالك ما يدعم التحويل بدقة ${preset.label}. اختر دقة أقل وجرّب مرة ثانية.`
-          : code === "NO_H264"
-            ? preset.id === "1080p"
-              ? "طريقة الحماية من الضغط تحتاج H.264، والمتصفح هذا ما يدعمه. افتح الصفحة في Chrome أو Safari، أو اختر «بدون»."
-              : `طريقة الحماية من الضغط تحتاج H.264، وجهازك ما يدعمه بدقة ${preset.label}. اختر 1080p أو اختر «بدون».`
-          : code === "UNDECODABLE"
-            ? "المتصفح هذا ما يقدر يقرأ صيغة الفيديو. افتح الصفحة في Safari (آيفون) أو Chrome (أندرويد) وجرّب مرة ثانية."
-            : "صار خطأ أثناء التحويل. جرّب دقة أقل، أو أغلق التطبيقات الثانية وحاول مرة ثانية.";
+        code === "NOT_ELIGIBLE"
+          ? (e as Error).message
+          : code === "NO_ENCODER"
+            ? "المتصفح هذا ما يقدر يسوي «نسخة أخف». افتح الصفحة في Safari أو Chrome محدّث."
+            : code === "UNDECODABLE"
+              ? "المتصفح ما يقدر يقرأ صيغة هذا المقطع للضغط. استخدم «الجودة القصوى» أو جرّب Safari أو Chrome."
+              : code === "NOT_SMALLER"
+                ? "المقطع مضغوط أصلًا، والنسخة الأخف ما طلعت أصغر منه. استخدم «الجودة القصوى»."
+                : "تعذّر إكمال العملية. أغلق التبويبات الثانية، وتأكد من المساحة، وجرّب مقطعًا أقصر.";
       setStage({ kind: "error", message, info });
     } finally {
       jobRef.current = null;
@@ -126,55 +122,47 @@ export default function Home() {
   }
 
   const outputName = file ? file.name.replace(/\.[^.]+$/, "") + "_HD.mp4" : "video_HD.mp4";
-
-  async function share() {
-    if (stage.kind !== "done") return;
-    const out = new File([stage.result.blob], outputName, { type: "video/mp4" });
-    try {
-      await navigator.share({ files: [out] });
-    } catch (e) {
-      if ((e as Error).name !== "AbortError") console.error(e);
-    }
-  }
-
   const canShareFiles =
     typeof navigator !== "undefined" &&
     typeof navigator.canShare === "function" &&
     navigator.canShare({ files: [new File([], "x.mp4", { type: "video/mp4" })] });
 
-  const info = "info" in stage ? stage.info : undefined;
-  const busy = stage.kind === "reading" || stage.kind === "encoding";
+  async function share() {
+    if (stage.kind !== "done") return;
+    try {
+      await navigator.share({ files: [new File([stage.result.blob], outputName, { type: "video/mp4" })] });
+    } catch (e) {
+      if ((e as Error).name !== "AbortError") console.error(e);
+    }
+  }
 
   return (
     <main dir="rtl" className="min-h-dvh bg-[#0b0b10] text-white">
       <div className="mx-auto max-w-lg px-4 pb-16 pt-8">
-        <header className="mb-6 text-center">
-          <div className="mx-auto mb-3 flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-[#25f4ee] to-[#fe2c55] text-2xl font-black">
-            HD
-          </div>
-          <h1 className="text-2xl font-extrabold">تيك توك بجودة عالية</h1>
-          <p className="mt-2 text-sm leading-relaxed text-white/60">
-            حوّل الفيديو لأفضل إعدادات للرفع على تيك توك، وبعدها ارفعه من موقع تيك توك.
-            كل شي يتم على جهازك، الفيديو ما يترفع لأي سيرفر.
+        <header className="mb-6">
+          <p className="text-xs font-semibold tracking-wider text-[#25f4ee]">استوديو الفيديو على جهازك</p>
+          <h1 className="mt-1 text-3xl font-extrabold leading-tight">جودة مقطعك، مثل ما صوّرته.</h1>
+          <p className="mt-2 text-sm leading-relaxed text-white/65">
+            جهّز مقطعك لتيك توك من المتصفح بدون إعادة ترميز: نفس الدقة (لين 4K) ونفس الفريمات (لين 60)
+            وألوان HDR. الفيديو ما يطلع من جهازك.
           </p>
+          <ol className="mt-4 grid grid-cols-3 gap-2 text-center text-xs text-white/70">
+            {["اختر مقطعك من «الملفات»", "نفحص توافقه", "احفظه وارفعه من المتصفح"].map((t, i) => (
+              <li key={t} className="rounded-xl bg-white/[0.05] p-2">
+                <span className="block text-base font-bold text-white">{i + 1}</span>
+                {t}
+              </li>
+            ))}
+          </ol>
         </header>
 
-        {supported === false && (
-          <Card className="border-[#fe2c55]/50">
-            <p className="text-sm leading-relaxed">
-              المتصفح الحالي ما يدعم تحويل الفيديو. افتح الصفحة في <b>Chrome</b> أو <b>Safari</b>{" "}
-              (آيفون iOS 16.4 أو أحدث)، مو من داخل متصفح تطبيق ثاني.
-            </p>
-          </Card>
-        )}
-
-        {/* 1. Pick a video */}
+        {/* 1. Pick */}
         <Card>
-          <StepTitle n={1}>اختر الفيديو</StepTitle>
           <input
             ref={inputRef}
+            id="video-file"
             type="file"
-            accept="video/*"
+            accept="video/*,.mov,.mp4"
             className="hidden"
             onChange={(e) => {
               void pickFile(e.target.files?.[0]);
@@ -183,144 +171,97 @@ export default function Home() {
           />
           <button
             type="button"
-            disabled={busy || supported === false}
+            disabled={busy}
             onClick={() => inputRef.current?.click()}
             className="w-full rounded-xl border-2 border-dashed border-white/20 px-4 py-6 text-center transition active:scale-[0.99] disabled:opacity-50"
           >
-            {file ? (
-              <span className="block truncate text-sm">{file.name}</span>
-            ) : (
-              <span className="text-base font-semibold">اضغط هنا واختر الفيديو من «الملفات»</span>
-            )}
+            <span className="block text-base font-semibold">
+              {file ? file.name : "اختر مقطعك"}
+            </span>
             <span className="mt-1 block text-xs text-white/50">
-              {file ? "اضغط لتغيير الفيديو" : "MP4 · MOV · من الكاميرا أو أي تطبيق مونتاج"}
+              {file ? "اضغط لتغيير المقطع" : "استعراض الملفات"}
             </span>
           </button>
           <p className="mt-2 rounded-lg bg-yellow-400/10 p-2 text-xs leading-relaxed text-yellow-100">
-            <b>مهم في الآيفون:</b> لا تختار من «الصور»، لأن الآيفون يضغط الفيديو ويحوّله لـ SDR قبل ما
-            يعطيه للصفحة. افتح المقطع في «الصور» ← مشاركة ← «حفظ في الملفات»، وبعدها اختره من «استعراض».
+            اختر من «الملفات»، مو من مكتبة الصور. على الآيفون: افتح المقطع في «الصور» ← مشاركة ←
+            «حفظ في الملفات»، وارجع اختره من هنا. الصور تعطي الصفحة نسخة مضغوطة.
           </p>
 
           {stage.kind === "reading" && (
-            <p className="mt-3 text-center text-sm text-white/60">جاري قراءة الفيديو…</p>
+            <p className="mt-3 text-center text-sm text-white/60">نفحص المقطع…</p>
           )}
 
-          {info && file && (
-            <dl className="mt-4 grid grid-cols-2 gap-2 text-sm">
-              <Info label="الدقة الحالية" value={`${info.width}×${info.height}`} />
-              <Info label="الفريمات" value={`${Math.round(info.fps)} fps`} />
-              <Info label="المدة" value={formatDuration(info.duration)} />
-              <Info label="الحجم" value={formatBytes(file.size)} />
-            </dl>
-          )}
-          {info?.hdr && presetId !== "original" && (
-            <p className="mt-3 rounded-lg bg-yellow-400/10 p-3 text-xs leading-relaxed text-yellow-200">
-              الفيديو مصوّر بـ HDR. تيك توك أحيانًا يعرض HDR بألوان باهتة، والأداة بتحوله لـ SDR.
-              للحصول على أفضل ألوان، طفّ HDR من إعدادات الكاميرا قبل التصوير.
-            </p>
-          )}
-        </Card>
-
-        {/* 2. Choose quality */}
-        <Card>
-          <StepTitle n={2}>اختر الجودة</StepTitle>
-          <div className="grid gap-2">
-            {PRESETS.map((p) => {
-              const size = info ? (p.id === "original" ? info : targetSize(info, p)) : null;
-              return (
-                <label
-                  key={p.id}
-                  className={`flex cursor-pointer items-center gap-3 rounded-xl border p-3 transition ${
-                    p.id === presetId ? "border-[#25f4ee] bg-[#25f4ee]/10" : "border-white/10"
-                  }`}
-                >
-                  <input
-                    type="radio"
-                    name="preset"
-                    value={p.id}
-                    checked={p.id === presetId}
-                    disabled={busy}
-                    onChange={() => setPresetId(p.id)}
-                    className="accent-[#25f4ee]"
-                  />
-                  <span className="flex-1">
-                    <span className="block font-semibold">
-                      {p.label}
-                      {p.id === "original" && (
-                        <span className="ms-2 rounded bg-[#fe2c55] px-1.5 py-0.5 text-[10px]">
-                          موصى به
-                        </span>
-                      )}
-                    </span>
-                    <span className="block text-xs text-white/50">{p.hint}</span>
-                  </span>
-                  {info && size && (
-                    <span className="text-left text-xs text-white/60" dir="ltr">
-                      {size.width}×{size.height}
-                      <br />≈ {formatBytes(estimateBytes(info, p, { fps60, cbr }))}
-                    </span>
-                  )}
-                </label>
-              );
-            })}
-          </div>
-          <div className="mt-4 grid gap-2">
-            <Toggle
-              id="fps60"
-              checked={fps60 && presetId !== "original"}
-              disabled={busy || presetId === "original"}
-              onChange={setFps60}
-              title="60 فريم"
-              hint="يطلع الفيديو 60fps حتى لو مصوّر 30، عشان تيك توك يعطيه جودة 1080p60."
-            />
-            <Toggle
-              id="cbr"
-              checked={cbr && presetId !== "original"}
-              disabled={busy || presetId === "original"}
-              onChange={setCbr}
-              title="معدل بت ثابت 50 ميجابت"
-              hint="نفس مواصفات الرفع في أداة أبو شداد (7-u8). يكبّر حجم الملف، بس يعطي تيك توك تفاصيل أكثر."
-            />
-            <fieldset className="grid gap-2 rounded-xl border border-white/10 p-3">
-              <legend className="px-1 font-semibold">طريقة الحماية من الضغط</legend>
-              {METHODS.map((m) => (
-                <label key={m.id} className="flex cursor-pointer items-start gap-3">
-                  <input
-                    type="radio"
-                    name="method"
-                    value={m.id}
-                    checked={method === m.id}
-                    disabled={busy}
-                    onChange={() => setMethod(m.id)}
-                    className="mt-1 accent-[#fe2c55]"
-                  />
-                  <span className="flex-1">
-                    <span className="block text-sm font-semibold">{m.title}</span>
-                    <span className="block text-xs leading-relaxed text-white/55">{m.hint}</span>
-                  </span>
-                </label>
-              ))}
-              <p className="text-[11px] leading-relaxed text-white/45">
-                هذي حيل غير رسمية تعدّل بيانات الملف بس، والصورة نفسها ما تتغير. ممكن تيك توك يوقفها
-                في أي وقت، أو يعتبرها مخالفة. جرّبها بنشر خاص أول.
-              </p>
-            </fieldset>
-          </div>
           {info && (
-            <p className="mt-3 text-xs text-white/50">
-              {presetId === "original"
-                ? `الإخراج: نفس الفيديو بدون إعادة ترميز (${info.width}×${info.height} · ${Math.round(info.fps)} fps${info.hdr ? " · HDR" : ""})`
-                : `الإخراج: H.264 · ${outputFrameRate(info, { fps60 })} fps ثابت${cbr ? " · 50 Mbps CBR" : ""} · صوت AAC`}
-              {method !== "none" && ` · ${METHODS.find((m) => m.id === method)!.short}`}
-            </p>
+            <>
+              <dl className="mt-4 grid grid-cols-2 gap-2 text-sm">
+                <Info label="الدقة" value={`${info.width}×${info.height}`} />
+                <Info label="الإطارات" value={`${Math.round(info.fps)} fps`} />
+                <Info label="الألوان" value={info.hdr ? "HDR" : "SDR"} />
+                <Info label="الحجم" value={formatBytes(info.size)} />
+              </dl>
+              {info.size > 500 * 1024 ** 2 && (
+                <p className="mt-2 text-xs text-yellow-200">
+                  الملف كبير نسبيًا للجوال. خلّ الشاشة مفتوحة، وتأكد إن عندك مساحة كافية.
+                </p>
+              )}
+            </>
           )}
         </Card>
 
-        {/* 3. Convert */}
+        {/* 2. Output */}
         <Card>
-          <StepTitle n={3}>حوّل الفيديو</StepTitle>
-          {stage.kind === "encoding" ? (
-            <div>
+          <h2 className="mb-3 font-bold">جهّز الفيديو</h2>
+          <div
+            className={`rounded-xl border p-3 ${
+              !light ? "border-[#25f4ee] bg-[#25f4ee]/10" : "border-white/10 opacity-60"
+            }`}
+          >
+            <p className="flex items-center gap-2 font-bold">
+              الجودة القصوى
+              <span className="rounded bg-[#25f4ee] px-1.5 py-0.5 text-[10px] text-black">الخيار الرئيسي</span>
+            </p>
+            <p className="mt-1 text-xs leading-relaxed text-white/65">
+              بدون إعادة ترميز: تبقى الدقة والفريمات وألوان HDR مثل الأصل، ونعدّل بيانات التوقيت في الملف
+              عشان تيك توك يحافظ على الفريمات. ما يكبّر مقطعًا أصغر إلى 4K.
+            </p>
+            <p
+              className={`mt-2 text-xs font-semibold ${
+                !info ? "text-white/45" : eligibility?.ok ? "text-[#25f4ee]" : "text-[#ff8da1]"
+              }`}
+            >
+              {!info
+                ? "اختر فيديو لنعرف هل يناسب الجودة القصوى."
+                : eligibility?.ok
+                  ? "✓ المقطع متوافق"
+                  : `✕ ${(eligibility as { reason: string }).reason}`}
+            </p>
+          </div>
+
+          <div className="mt-2 grid gap-2">
+            <Toggle
+              id="light"
+              checked={light}
+              disabled={busy || !lightSupported}
+              onChange={setLight}
+              title="نسخة أخف"
+              hint={
+                lightSupported
+                  ? "نسخة أصغر بجودة عالية قدر الإمكان (H.264، لين 1080p). خيار مستقل عن الجودة القصوى، وأوقفه للرجوع لها."
+                  : "المتصفح هذا ما يدعم الضغط."
+              }
+            />
+            <Toggle
+              id="mute"
+              checked={mute}
+              disabled={busy}
+              onChange={setMute}
+              title="نسخة بلا صوت"
+              hint="يشيل الصوت من الملف، إذا بتضيف صوت من مكتبة تيك توك."
+            />
+          </div>
+
+          {stage.kind === "working" ? (
+            <div className="mt-4">
               <div className="h-3 overflow-hidden rounded-full bg-white/10">
                 <div
                   className="h-full rounded-full bg-gradient-to-l from-[#25f4ee] to-[#fe2c55] transition-[width]"
@@ -329,16 +270,11 @@ export default function Home() {
               </div>
               <div className="mt-2 flex justify-between text-sm text-white/70">
                 <span>{Math.round(stage.progress * 100)}%</span>
-                <span>
-                  {formatDuration((now - stage.startedAt) / 1000)}
-                  {stage.progress > 0.05 &&
-                    ` · باقي تقريبًا ${formatDuration(
-                      ((now - stage.startedAt) / 1000) * (1 / stage.progress - 1),
-                    )}`}
-                </span>
+                <span>{formatDuration((now - stage.startedAt) / 1000)}</span>
               </div>
               <p className="mt-2 text-xs text-white/50">
-                خلّ الصفحة مفتوحة والشاشة شغالة لين يخلص التحويل.
+                لا تحدّث الصفحة، وخلّ الشاشة مفتوحة. الجوال ممكن يوقف المعالجة إذا قفلت الشاشة أو بدّلت
+                التطبيق.
               </p>
               <button
                 type="button"
@@ -351,76 +287,53 @@ export default function Home() {
           ) : (
             <button
               type="button"
-              disabled={!info || busy || supported === false}
+              disabled={!canStart}
               onClick={() => void start()}
-              className="w-full rounded-xl bg-gradient-to-l from-[#25f4ee] to-[#fe2c55] py-4 text-lg font-bold text-black transition active:scale-[0.99] disabled:opacity-40"
+              className="mt-4 w-full rounded-xl bg-gradient-to-l from-[#25f4ee] to-[#fe2c55] py-4 text-lg font-bold text-black transition active:scale-[0.99] disabled:opacity-40"
             >
-              {stage.kind === "done" ? "حوّل مرة ثانية" : "ابدأ التحويل بجودة عالية"}
+              {light ? "اضغط النسخة الأخف" : "إنتاج الجودة القصوى"}
             </button>
           )}
           {stage.kind === "error" && (
-            <p className="mt-3 rounded-lg bg-[#fe2c55]/15 p-3 text-sm text-[#ff8da1]">
-              {stage.message}
-            </p>
+            <p className="mt-3 rounded-lg bg-[#fe2c55]/15 p-3 text-sm text-[#ff8da1]">{stage.message}</p>
           )}
         </Card>
 
-        {/* 4. Result */}
+        {/* 3. Result */}
         {stage.kind === "done" && (
           <Card className="border-[#25f4ee]/40">
-            <StepTitle n={4}>جاهز! ارفعه على تيك توك</StepTitle>
-            <video
-              src={stage.url}
-              controls
-              playsInline
-              className="mx-auto max-h-[60vh] w-full rounded-xl bg-black"
-            />
-            <p className="mt-3 text-center text-xs text-white/60" dir="ltr">
-              {stage.result.width}×{stage.result.height} · {Math.round(stage.result.fps * 100) / 100} fps ·{" "}
-              {stage.result.codec}
-              {stage.result.cbr && " CBR"} · {formatBytes(stage.result.blob.size)} ·{" "}
-              {formatDuration(stage.seconds)}
-            </p>
-            {stage.result.applied !== "none" && (
-              <p className="mt-2 text-center text-xs text-[#25f4ee]">
-                تم تطبيق: {METHODS.find((m) => m.id === stage.result.applied)!.title}
-              </p>
-            )}
-            {stage.result.rewriteFailed && (
-              <p className="mt-2 rounded-lg bg-yellow-400/10 p-2 text-center text-xs text-yellow-200">
-                ما قدرنا نطبّق طريقة الحماية على هذا الملف، فطلع بالتحويل العادي.
-              </p>
-            )}
-
-            <div className="mt-4 rounded-xl bg-[#fe2c55]/10 p-3 text-sm leading-relaxed">
-              <p className="font-bold">لا تشاركه لتطبيق تيك توك</p>
-              <p className="mt-1 text-white/75">
-                التطبيق يضغط الفيديو في جهازك قبل ما يرفعه، ويمسح التعديلات. ارفعه من موقع تيك توك:
-              </p>
-              <ol className="mt-2 list-decimal space-y-1 ps-5 text-white/85">
-                <li>
-                  احفظ الفيديو
-                  {canShareFiles && " (اختر «حفظ في الملفات» من قائمة المشاركة)"}.
-                </li>
-                <li>
-                  افتح <b dir="ltr">tiktok.com/tiktokstudio/upload</b>. على الآيفون: Safari ← زر «aA»
-                  ← «طلب موقع سطح المكتب».
-                </li>
-                <li>
-                  ارفع الملف، وخلّ «من يمكنه المشاهدة» على «الجميع»، وانشر مباشرة بدون ما تضيف صوت أو
-                  مؤثرات داخل تيك توك.
-                </li>
-              </ol>
+            <h2 className="mb-3 font-bold">✓ مقطعك جاهز للحفظ</h2>
+            <video src={stage.url} controls playsInline className="max-h-[60vh] w-full rounded-xl bg-black" />
+            <div className="mt-3 grid grid-cols-[1fr_auto_1fr] items-center gap-2 text-center text-xs">
+              <div className="rounded-lg bg-white/5 p-2">
+                <p className="text-white/50">قبل</p>
+                <p dir="ltr">
+                  {stage.info.width}×{stage.info.height} · {Math.round(stage.info.fps)}fps
+                </p>
+                <p>
+                  {codecName(stage.info.codec)} · {formatBytes(stage.info.size)}
+                </p>
+              </div>
+              <span className="text-white/40">←</span>
+              <div className="rounded-lg bg-[#25f4ee]/10 p-2">
+                <p className="text-white/50">بعد</p>
+                <p dir="ltr">
+                  {stage.result.width}×{stage.result.height} · {Math.round(stage.result.fps)}fps
+                  {stage.result.hdr && " · HDR"}
+                </p>
+                <p>
+                  {stage.result.codec} · {formatBytes(stage.result.blob.size)}
+                </p>
+              </div>
             </div>
-
-            <div className="mt-3 grid gap-2">
+            <div className="mt-4 grid gap-2">
               {canShareFiles ? (
                 <button
                   type="button"
                   onClick={() => void share()}
                   className="rounded-xl bg-white py-4 text-lg font-bold text-black active:scale-[0.99]"
                 >
-                  حفظ الفيديو
+                  احفظ المقطع
                 </button>
               ) : (
                 <a
@@ -428,79 +341,138 @@ export default function Home() {
                   download={outputName}
                   className="rounded-xl bg-white py-4 text-center text-lg font-bold text-black"
                 >
-                  حفظ الفيديو
+                  احفظ المقطع
                 </a>
               )}
-              <a
-                href="https://www.tiktok.com/tiktokstudio/upload"
-                target="_blank"
-                rel="noreferrer"
-                className="rounded-xl border border-white/20 py-3 text-center font-semibold"
-              >
-                فتح صفحة الرفع في تيك توك
+              <a href="#upload" className="rounded-xl border border-white/20 py-3 text-center font-semibold">
+                خطوات الرفع إلى تيك توك ↓
               </a>
             </div>
+            <p className="mt-3 text-xs leading-relaxed text-white/55">
+              على الآيفون اختر «حفظ في الملفات» من قائمة المشاركة. افتح الملف المحفوظ وتأكد من المدة والصورة
+              والصوت قبل الرفع، واحتفظ بنسختك الأصلية.
+            </p>
           </Card>
         )}
 
-        {/* Tips */}
+        {/* Upload guide */}
         <Card>
-          <h2 className="mb-3 font-bold">عشان تيك توك ما يخرّب الجودة</h2>
-          <ol className="list-decimal space-y-2 ps-5 text-sm leading-relaxed text-white/75">
-            <li>
-              في صفحة النشر بتيك توك: <b>المزيد من الخيارات</b> ← فعّل{" "}
-              <b>«السماح بالتحميل بجودة عالية» / Upload HD</b>.
-            </li>
-            <li>
-              من الإعدادات: <b>الإعدادات والخصوصية ← توفير البيانات</b> خله <b>مطفي</b>.
-            </li>
-            <li>ارفع على Wi‑Fi قوي، لأن تيك توك يخفض الجودة إذا النت ضعيف وقت الرفع.</li>
-            <li>
-              سوّ المونتاج والنصوص قبل التحويل. الفلاتر والنصوص من محرر تيك توك تخلي التطبيق
-              يعيد ضغط الفيديو.
-            </li>
-            <li>صوّر بأعلى دقة عندك (4K أو 1080p) و30 أو 60 فريم، وبإضاءة كويسة.</li>
-            <li>
-              الأفضل ترفع من الكمبيوتر من موقع تيك توك. من الجوال، استخدم Safari بوضع «موقع سطح
-              المكتب» بدل التطبيق.
-            </li>
-            <li>
-              تيك توك أحيانًا يعرض نسخة ضعيفة أول كم ساعة بعد النشر، لين يخلص يجهّز النسخة العالية.
-            </li>
+          <h2 id="upload" className="mb-1 scroll-mt-4 font-bold">
+            ارفع مقطعك إلى تيك توك
+          </h2>
+          <p className="mb-3 text-xs leading-relaxed text-white/60">
+            لا تشاركه لتطبيق تيك توك: التطبيق يضغط الفيديو قبل الرفع. ارفعه يدويًا من المتصفح.
+          </p>
+          <div className="mb-3 grid grid-cols-3 gap-1 rounded-xl bg-white/5 p-1 text-sm" role="tablist">
+            {(
+              [
+                ["iphone", "آيفون"],
+                ["android", "أندرويد"],
+                ["computer", "كمبيوتر"],
+              ] as const
+            ).map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                role="tab"
+                aria-selected={device === id}
+                onClick={() => setDevice(id)}
+                className={`rounded-lg py-2 ${device === id ? "bg-white font-bold text-black" : "text-white/70"}`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <ol className="list-decimal space-y-2 ps-5 text-sm leading-relaxed text-white/80">
+            {device === "iphone" && (
+              <>
+                <li>احفظ المقطع: «مشاركة» ← «حفظ في الملفات».</li>
+                <li>
+                  افتح TikTok Studio في Safari، واضغط «aA» بجانب العنوان ← «طلب موقع ويب سطح المكتب».
+                </li>
+                <li>سجّل دخولك، واختر الملف من «الملفات».</li>
+              </>
+            )}
+            {device === "android" && (
+              <>
+                <li>احفظ المقطع، وتلقاه في «التنزيلات».</li>
+                <li>افتح TikTok Studio في Chrome، واضغط ⋮ ← فعّل «موقع سطح المكتب».</li>
+                <li>سجّل دخولك، واختر الملف من التنزيلات.</li>
+              </>
+            )}
+            {device === "computer" && (
+              <>
+                <li>احفظ المقطع وافتحه في مشغّل فيديو للتأكد منه.</li>
+                <li>افتح TikTok Studio في المتصفح وسجّل دخولك.</li>
+                <li>اسحب الملف إلى خانة الرفع.</li>
+              </>
+            )}
+            <li>خلّ «من يمكنه المشاهدة» على «الجميع».</li>
+            <li>انشر مباشرة بدون ما تضيف صوت أو مؤثرات داخل تيك توك. تعديل الوصف عادي.</li>
           </ol>
+          <a
+            href="https://www.tiktok.com/tiktokstudio/upload"
+            target="_blank"
+            rel="noreferrer"
+            className="mt-4 block rounded-xl bg-[#fe2c55] py-3 text-center font-bold"
+          >
+            فتح TikTok Studio ↗
+          </a>
+          <p className="mt-3 text-[11px] leading-relaxed text-white/45">
+            إكمال الرفع ما يضمن الدقة اللي بيعرضها تيك توك للمشاهدين، لأن تيك توك يعالج المقطع بعد الرفع.
+            تعديل بيانات التوقيت حيلة غير رسمية، ممكن تيك توك يوقفها في أي وقت.
+          </p>
         </Card>
+
+        {/* Troubleshooting */}
+        <Card>
+          <h2 className="mb-2 font-bold">مشاكل شائعة</h2>
+          <div className="divide-y divide-white/10 text-sm">
+            <Faq q="المدة صارت 0:00، أو تيك توك يقول المقطع أطول من 60 دقيقة">
+              افتح الملف المحفوظ وتأكد من مدته. إذا المدة غلط لا ترفعه، وجرّب مرة ثانية من المقطع الأصلي.
+            </Faq>
+            <Faq q="الملف 4K بس تيك توك ما يعرض 4K">
+              الجودة القصوى تحافظ على دقة المصدر، بس اللي يعرضه تيك توك يعتمد على معالجته بعد الرفع. تأكد إنك
+              رفعت من المتصفح بدون مؤثرات أو صوت مضاف.
+            </Faq>
+            <Faq q="ألوان HDR تغيّرت">
+              قارن المصدر والناتج على نفس الشاشة ونفس المشغّل. الجودة القصوى ما تغيّر ألوان الفيديو.
+            </Faq>
+            <Faq q="المعالجة بطيئة أو النسبة واقفة">
+              خلّ المتصفح قدام والشاشة مفتوحة، وأغلق التبويبات الثانية، وجرّب مقطعًا أقصر.
+            </Faq>
+            <Faq q="ما ألقى الفيديو في الصور">
+              من «مشاركة» اختر «حفظ في الملفات»، وبعدها افتح تطبيق «الملفات» وروح للمجلد اللي اخترته.
+            </Faq>
+          </div>
+        </Card>
+
+        <p className="text-center text-[11px] text-white/40">
+          المعالجة كلها على جهازك. الفيديو ما يترفع لأي خادم.
+        </p>
       </div>
     </main>
   );
 }
 
-const METHODS: { id: EncodeOptions["method"]; title: string; short: string; hint: string }[] = [
-  {
-    id: "timescale",
-    title: "تعديل التوقيت «120 FPS» (الأكثر استخدامًا)",
-    short: "توقيت 30fps",
-    hint: "يعدّل أرقام التوقيت في رأس الملف بس، بدون بيانات وهمية ولا تغيير في المدة. تستخدمه أداة أبو شداد وH4B وrealbay من أكتوبر 2026. يحتاج 60 فريم.",
-  },
-  {
-    id: "silent",
-    title: "Silent Method (الأحدث، نوفمبر 2026)",
-    short: "Silent",
-    hint: "يرتّب الصوت والصورة، ويضيف عينات وهمية ما تأثر على المدة، ويمسح بيانات برامج المونتاج.",
-  },
-  {
-    id: "audio",
-    title: "نسخ الصوت (سبتمبر 2026)",
-    short: "نسخ الصوت",
-    hint: "يضيف نسخة ثانية من مسار الصوت ببيانات مضخّمة.",
-  },
-  {
-    id: "frames",
-    title: "فريمات وهمية (Decoy القديمة)",
-    short: "Decoy ×10",
-    hint: "يخلي الملف يبيّن إن فيه فريمات أكثر بعشر مرات. يقال إن تيك توك قفلها.",
-  },
-  { id: "none", title: "بدون", short: "", hint: "تحويل بجودة عالية بس، بدون أي تعديل على الملف." },
-];
+function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
+  return (
+    <section className={`mb-4 rounded-2xl border border-white/10 bg-white/[0.04] p-4 ${className}`}>
+      {children}
+    </section>
+  );
+}
+
+function Info({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg bg-white/5 p-2">
+      <dt className="text-xs text-white/50">{label}</dt>
+      <dd className="font-semibold" dir="ltr">
+        {value}
+      </dd>
+    </div>
+  );
+}
 
 function Toggle({
   id,
@@ -522,7 +494,7 @@ function Toggle({
       htmlFor={id}
       className={`flex cursor-pointer items-start gap-3 rounded-xl border p-3 transition ${
         checked ? "border-[#fe2c55] bg-[#fe2c55]/10" : "border-white/10"
-      }`}
+      } ${disabled ? "opacity-50" : ""}`}
     >
       <input
         id={id}
@@ -540,32 +512,11 @@ function Toggle({
   );
 }
 
-function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
+function Faq({ q, children }: { q: string; children: React.ReactNode }) {
   return (
-    <section className={`mb-4 rounded-2xl border border-white/10 bg-white/[0.04] p-4 ${className}`}>
-      {children}
-    </section>
-  );
-}
-
-function StepTitle({ n, children }: { n: number; children: React.ReactNode }) {
-  return (
-    <h2 className="mb-3 flex items-center gap-2 font-bold">
-      <span className="flex h-6 w-6 items-center justify-center rounded-full bg-white text-xs text-black">
-        {n}
-      </span>
-      {children}
-    </h2>
-  );
-}
-
-function Info({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-lg bg-white/5 p-2">
-      <dt className="text-xs text-white/50">{label}</dt>
-      <dd className="font-semibold" dir="ltr">
-        {value}
-      </dd>
-    </div>
+    <details className="py-2">
+      <summary className="cursor-pointer font-semibold">{q}</summary>
+      <p className="mt-1 text-xs leading-relaxed text-white/65">{children}</p>
+    </details>
   );
 }

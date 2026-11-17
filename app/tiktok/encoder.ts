@@ -1,58 +1,13 @@
-// Re-encodes a video in the browser (WebCodecs via mediabunny) with settings
-// that survive TikTok's own re-compression as well as possible:
-// 9:16-friendly resolution, constant frame rate, H.264 at a high bitrate, AAC audio.
+// Prepares a video for TikTok in the browser. Two outputs, mirroring the flow
+// SHANAB MAX describes (our own implementation):
+//
+// - "max": no re-encode. The recorded video and audio are copied into an MP4 as
+//   they are (resolution up to 4K, frame rate up to 60, HDR kept), then the
+//   container's timing headers are rewritten (see container.ts).
+// - "light": a smaller re-encoded copy (H.264, at most 1080p / 60 fps). It is a
+//   separate option, gets no container rewrite, and is refused if it isn't smaller.
+//
 // Nothing is uploaded anywhere; all work happens on the device.
-
-export type PresetId = "original" | "1080p" | "2k" | "4k";
-
-export type Preset = {
-  id: PresetId;
-  label: string;
-  hint: string;
-  /** Long side / short side of the output, before aspect-ratio fitting. */
-  long: number;
-  short: number;
-  /** Video bitrate at 30 fps, in bits per second. Scaled up for higher frame rates. */
-  bitrate30: number;
-};
-
-export const PRESETS: Preset[] = [
-  {
-    // Like SHANAB MAX: no re-encode, so resolution (up to 4K), frame rate and HDR stay as recorded.
-    id: "original",
-    label: "الأصلي بدون إعادة ترميز",
-    hint: "يحافظ على دقة المقطع وفريماته وألوان HDR مثل ما صوّرته، وهي نفس فكرة شنب. أسرع خيار.",
-    long: 0,
-    short: 0,
-    bitrate30: 0,
-  },
-  {
-    id: "1080p",
-    label: "Full HD 1080p",
-    hint: "الأنسب لأغلب الفيديوهات وأسرع تحويل",
-    long: 1920,
-    short: 1080,
-    bitrate30: 25_000_000,
-  },
-  {
-    id: "2k",
-    label: "2K 1440p",
-    hint: "تفاصيل أوضح، حجم أكبر",
-    long: 2560,
-    short: 1440,
-    bitrate30: 40_000_000,
-  },
-  {
-    id: "4k",
-    label: "4K 2160p",
-    hint: "أعلى جودة، يحتاج جوال قوي ووقت أطول",
-    long: 3840,
-    short: 2160,
-    bitrate30: 60_000_000,
-  },
-];
-
-export const AUDIO_BITRATE = 320_000;
 
 export type VideoInfo = {
   duration: number;
@@ -63,15 +18,15 @@ export type VideoInfo = {
   codec: string | null;
   hdr: boolean;
   hasAudio: boolean;
+  size: number;
 };
 
-export function isSupportedBrowser() {
-  return (
-    typeof window !== "undefined" &&
-    "VideoEncoder" in window &&
-    "VideoDecoder" in window
-  );
-}
+export type Mode = "max" | "light";
+
+export type Eligibility = { ok: true } | { ok: false; reason: string };
+
+const CODEC_NAMES: Record<string, string> = { avc: "H.264", hevc: "HEVC", vp9: "VP9", av1: "AV1" };
+export const codecName = (c: string | null) => (c ? (CODEC_NAMES[c] ?? c) : "؟");
 
 export async function readVideoInfo(file: File): Promise<VideoInfo> {
   const { Input, BlobSource, ALL_FORMATS } = await import("mediabunny");
@@ -96,59 +51,29 @@ export async function readVideoInfo(file: File): Promise<VideoInfo> {
       codec: video.codec,
       hdr,
       hasAudio: audio !== null,
+      size: file.size,
     };
   } finally {
     input.dispose();
   }
 }
 
-/** Snaps a measured (possibly variable) frame rate to the nearest standard one, capped at 60. */
-export function targetFrameRate(fps: number) {
-  const standard = [24, 25, 30, 50, 60];
-  const capped = Math.min(Number.isFinite(fps) && fps > 0 ? fps : 30, 60);
-  return standard.reduce((best, f) =>
-    Math.abs(f - capped) < Math.abs(best - capped) ? f : best,
-  );
+/** Whether the no-re-encode output can be made from this source. */
+export function maxEligibility(info: VideoInfo): Eligibility {
+  if (info.codec !== "avc" && info.codec !== "hevc") {
+    return { ok: false, reason: `صيغة الفيديو (${codecName(info.codec)}) ما تنفع بدون تحويل. جرّب «نسخة أخف».` };
+  }
+  const long = Math.max(info.width, info.height);
+  const short = Math.min(info.width, info.height);
+  if (long > 3840 || short > 2160) return { ok: false, reason: "الدقة أعلى من 4K. جرّب «نسخة أخف»." };
+  if (info.fps > 61) return { ok: false, reason: `المقطع ${Math.round(info.fps)} فريم، والحد 60. جرّب «نسخة أخف».` };
+  if (info.duration > 600) return { ok: false, reason: "المقطع أطول من 10 دقائق. قصّه وجرّب مرة ثانية." };
+  return { ok: true };
 }
 
-const even = (n: number) => Math.max(2, Math.round(n / 2) * 2);
-
-/** Fits the source aspect ratio inside the preset's box (portrait or landscape to match the source). */
-export function targetSize(info: Pick<VideoInfo, "width" | "height">, preset: Preset) {
-  const portrait = info.height >= info.width;
-  const boxW = portrait ? preset.short : preset.long;
-  const boxH = portrait ? preset.long : preset.short;
-  const scale = Math.min(boxW / info.width, boxH / info.height);
-  return { width: even(info.width * scale), height: even(info.height * scale) };
-}
-
-/** Constant bitrate used by the 7-u8 toolkit's upload spec (1080p H.264, 50 Mbps CBR). */
-export const CBR_BITRATE = 50_000_000;
-
-export function targetBitrate(preset: Preset, fps: number, cbr = false) {
-  const vbr = Math.round(preset.bitrate30 * (fps > 30 ? 1.5 : 1));
-  return cbr ? Math.max(vbr, CBR_BITRATE) : vbr;
-}
-
-export type Method = "timescale" | "silent" | "audio" | "frames" | "none";
-
-export type EncodeOptions = {
-  /** Output 60 fps even when the source is slower (frames are repeated). */
-  fps60: boolean;
-  /** Encode at a constant 50 Mbps (or the preset's rate, if higher) instead of variable bitrate. */
-  cbr: boolean;
-  /**
-   * Container rewrite applied after encoding (all of them force H.264):
-   * "timescale" = mvhd/mdhd timing scaled to 30 fps ("120 FPS method", Oct 2026),
-   * "silent" = interleave + fake samples outside stts (Silent Method, Nov 2026),
-   * "audio" = duplicated audio track with inflated sample tables (Sept 2026),
-   * "frames" = ghost video frames (older method), "none" = plain file.
-   */
-  method: Method;
-};
-
-export function outputFrameRate(info: Pick<VideoInfo, "fps">, opts: Pick<EncodeOptions, "fps60">) {
-  return opts.fps60 ? 60 : targetFrameRate(info.fps);
+/** Whether this browser can make the re-encoded copy. */
+export function canMakeLight() {
+  return typeof window !== "undefined" && "VideoEncoder" in window && "VideoDecoder" in window;
 }
 
 /** Turns 59.94 / 29.97-style rates into their exact NTSC values, as the 7-u8 patch does. */
@@ -161,190 +86,146 @@ export function exactFps(fps: number) {
   return fps;
 }
 
-export function estimateBytes(
-  info: VideoInfo,
-  preset: Preset,
-  opts: Pick<EncodeOptions, "fps60" | "cbr">,
-) {
-  if (preset.id === "original") return info.bitrate * info.duration / 8;
-  const fps = outputFrameRate(info, opts);
-  const audio = info.hasAudio ? AUDIO_BITRATE : 0;
-  return ((targetBitrate(preset, fps, opts.cbr) + audio) * info.duration) / 8;
-}
-
-const CODEC_NAMES: Record<string, string> = { avc: "H.264", hevc: "HEVC", vp9: "VP9", av1: "AV1" };
-
-export type EncodeResult = {
+export type Result = {
   blob: Blob;
   width: number;
   height: number;
   fps: number;
   codec: string;
-  /** The rewrite that was actually applied. */
-  applied: Method;
-  /** Whether the 50 Mbps constant bitrate was used (false when the device fell back to VBR). */
-  cbr: boolean;
-  /** True when a rewrite was requested but couldn't be applied to this file. */
-  rewriteFailed: boolean;
+  hdr: boolean;
+  /** Container rewrite applied to a "max" output. */
+  patch: "timescale" | "silent" | "none";
 };
 
-export type EncodeJob = {
-  promise: Promise<EncodeResult>;
-  cancel: () => void;
-};
+export type Job = { promise: Promise<Result>; cancel: () => void };
 
-export class EncodeError extends Error {
+export class PrepareError extends Error {
   constructor(
-    public code: "UNSUPPORTED_SIZE" | "NO_H264" | "UNDECODABLE" | "INVALID" | "CANCELED",
+    public code: "NOT_ELIGIBLE" | "NO_ENCODER" | "UNDECODABLE" | "NOT_SMALLER" | "INVALID" | "CANCELED",
     message?: string,
   ) {
     super(message ?? code);
   }
 }
 
-export function encodeForTikTok(
+const even = (n: number) => Math.max(2, Math.round(n / 2) * 2);
+
+export function prepareForTikTok(
   file: File,
   info: VideoInfo,
-  preset: Preset,
-  opts: EncodeOptions,
+  mode: Mode,
+  opts: { mute: boolean },
   onProgress: (p: number) => void,
-): EncodeJob {
+): Job {
   let cancelRequested = false;
   let conversion: { cancel: () => Promise<void> } | null = null;
 
-  const promise = (async (): Promise<EncodeResult> => {
+  const promise = (async (): Promise<Result> => {
     const mb = await import("mediabunny");
-    // Some browsers (e.g. older Safari) can't encode AAC natively; use the WASM encoder there.
-    if (info.hasAudio && !(await mb.canEncodeAudio("aac"))) {
-      const { registerAacEncoder } = await import("@mediabunny/aac-encoder");
-      registerAacEncoder();
+    if (mode === "max") {
+      const e = maxEligibility(info);
+      if (!e.ok) throw new PrepareError("NOT_ELIGIBLE", e.reason);
+    } else if (!canMakeLight()) {
+      throw new PrepareError("NO_ENCODER");
     }
-    const original = preset.id === "original";
-    const { width, height } = original ? info : targetSize(info, preset);
-    const fps = original ? exactFps(info.fps) : outputFrameRate(info, opts);
-    let codec: "avc" | "hevc" | "vp9" | null = null;
-    let quality: InstanceType<typeof mb.Quality> | null = null;
-    let usedCbr = false;
-    if (!original) {
-      // Prefer the requested rate control; if the device can't do 50 Mbps CBR, use the preset VBR.
-      const qualities = [
-        ...(opts.cbr
-          ? [new mb.Quality({ bitrate: targetBitrate(preset, fps, true), bitrateMode: "constant" })]
-          : []),
-        new mb.Quality({ bitrate: targetBitrate(preset, fps), bitrateMode: "variable" }),
-      ];
 
-      // H.264 is what TikTok handles best; fall back to HEVC, then VP9, if the device can't do it at this size.
-      // The container rewrites only work on H.264.
-      search: for (const q of qualities) {
-        for (const c of opts.method !== "none" ? (["avc"] as const) : (["avc", "hevc", "vp9"] as const)) {
-          if (await mb.canEncodeVideo(c, { width, height, quality: q, frameRate: fps })) {
-            codec = c;
-            quality = q;
-            break search;
-          }
-        }
+    // The light copy: H.264 at most 1080p (short side) and 60 fps.
+    const scale = Math.min(1, 1080 / Math.min(info.width, info.height));
+    const width = mode === "max" ? info.width : even(info.width * scale);
+    const height = mode === "max" ? info.height : even(info.height * scale);
+    const fps = mode === "max" ? exactFps(info.fps) : Math.min(60, Math.round(info.fps) || 30);
+
+    let codec: "avc" | "hevc" = "avc";
+    const quality = new mb.Quality("high");
+    if (mode === "light") {
+      const ok = async (c: "avc" | "hevc") => mb.canEncodeVideo(c, { width, height, quality, frameRate: fps });
+      if (await ok("avc")) codec = "avc";
+      else if (await ok("hevc")) codec = "hevc";
+      else throw new PrepareError("NO_ENCODER");
+      if (!opts.mute && info.hasAudio && !(await mb.canEncodeAudio("aac"))) {
+        const { registerAacEncoder } = await import("@mediabunny/aac-encoder");
+        registerAacEncoder();
       }
-      usedCbr = opts.cbr && quality === qualities[0];
-      if (!codec) throw new EncodeError(opts.method !== "none" ? "NO_H264" : "UNSUPPORTED_SIZE");
     }
-    if (cancelRequested) throw new EncodeError("CANCELED");
+    if (cancelRequested) throw new PrepareError("CANCELED");
 
     const input = new mb.Input({ source: new mb.BlobSource(file), formats: mb.ALL_FORMATS });
     const target = new mb.BufferTarget();
-    const output = new mb.Output({
-      format: new mb.Mp4OutputFormat({ fastStart: "in-memory" }),
-      target,
-    });
+    const output = new mb.Output({ format: new mb.Mp4OutputFormat({ fastStart: "in-memory" }), target });
 
     try {
       const conv = await mb.Conversion.init({
         input,
         output,
         tracks: "primary",
-        // "original" copies the encoded video as is (only the container changes to MP4).
-        video: original
-          ? {}
-          : {
-              width,
-              height,
-              fit: "contain",
-              frameRate: fps,
-              codec: codec!,
-              quality: quality!,
-              // Long GOP like the reference tool (keyframes roughly every 9 s).
-              keyFrameInterval: opts.method === "audio" ? 9.1 : 2,
-              forceTranscode: true,
-              // Bake rotation into the pixels so every app shows it upright.
-              allowTransformationMetadata: false,
-            },
-        // AAC sources (almost every phone video) are copied untouched; anything else becomes AAC.
-        audio: { codec: "aac", quality: new mb.Quality({ bitrate: AUDIO_BITRATE }) },
+        // "max" copies the encoded video untouched; only the container becomes MP4.
+        video:
+          mode === "max"
+            ? {}
+            : {
+                width,
+                height,
+                fit: "contain",
+                frameRate: fps,
+                codec,
+                quality,
+                forceTranscode: true,
+                allowTransformationMetadata: false,
+              },
+        // AAC (what phones record) is copied; anything else becomes AAC.
+        audio: opts.mute ? { discard: true } : { codec: "aac" },
         tags: {},
         showWarnings: false,
       });
       conversion = conv;
       if (!conv.isValid) {
         const reasons = conv.discardedTracks.map((t) => t.reason);
-        throw new EncodeError(
+        throw new PrepareError(
           reasons.some((r) => r.startsWith("undecodable")) ? "UNDECODABLE" : "INVALID",
           reasons.join(", "),
         );
       }
       if (cancelRequested) {
         await conv.cancel();
-        throw new EncodeError("CANCELED");
+        throw new PrepareError("CANCELED");
       }
       conv.onProgress = (p) => onProgress(p);
       await conv.execute();
     } catch (e) {
-      if (e instanceof mb.ConversionCanceledError || cancelRequested) {
-        throw new EncodeError("CANCELED");
-      }
+      if (e instanceof mb.ConversionCanceledError || cancelRequested) throw new PrepareError("CANCELED");
       throw e;
     } finally {
       input.dispose();
     }
 
     const buffer = target.buffer;
-    if (!buffer) throw new EncodeError("INVALID", "empty output");
-
+    if (!buffer) throw new PrepareError("INVALID", "empty output");
     let bytes: Uint8Array<ArrayBuffer> = new Uint8Array(buffer);
-    let applied: EncodeResult["applied"] = "none";
-    let rewriteFailed = false;
-    // Each rewrite has a precondition; when it isn't met, use the closest one that applies.
-    let method = opts.method;
-    if (method === "timescale" && fps <= 30) method = "silent";
-    if (method === "audio" && !info.hasAudio) method = "frames";
-    // Ghost frames patch avcC, so they need H.264; other sources get the Silent Method instead.
-    if (method === "frames" && original && info.codec !== "avc") method = "silent";
-    if (method !== "none") {
-      const m = await import("./decoy");
+
+    let patch: Result["patch"] = "none";
+    if (mode === "max") {
+      // Above 30 fps: declare 30 fps via the timing headers. At 30 fps or below
+      // there is nothing to scale, so use the Silent Method instead.
+      const c = await import("./container");
       try {
-        const r =
-          method === "timescale" ? m.applyTimescale(bytes, fps, 30)
-          : method === "silent" ? m.applySilent(bytes)
-          : method === "audio" ? m.applyAudioClone(bytes)
-          : m.applyDecoy(bytes);
+        const r = fps > 30.5 ? c.applyTimescale(bytes, fps, 30) : c.applySilent(bytes);
         bytes = r.bytes as Uint8Array<ArrayBuffer>;
-        applied = method;
+        patch = fps > 30.5 ? "timescale" : "silent";
       } catch (e) {
         console.error(e);
-        rewriteFailed = true;
       }
+    } else if (bytes.length >= file.size) {
+      throw new PrepareError("NOT_SMALLER");
     }
 
     return {
-      applied,
-      rewriteFailed,
-      cbr: usedCbr,
       blob: new Blob([bytes], { type: "video/mp4" }),
       width,
       height,
       fps,
-      codec: original
-        ? `${CODEC_NAMES[info.codec ?? ""] ?? info.codec ?? "?"} (بدون إعادة ترميز)`
-        : CODEC_NAMES[codec!],
+      codec: mode === "max" ? codecName(info.codec) : codecName(codec),
+      hdr: mode === "max" && info.hdr,
+      patch,
     };
   })();
 

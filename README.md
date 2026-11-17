@@ -110,11 +110,16 @@ Built with ❤️ using React Router.
 
 ## TikTok HD tool (`/`)
 
-The home page is a mobile-first tool (Arabic, RTL) that re-encodes a video on the
-phone before uploading it to TikTok: 1080p / 2K / 4K output in 9:16, constant frame
-rate, H.264 at a high bitrate, and AAC audio. It uses WebCodecs through
-[mediabunny](https://mediabunny.dev), so the work runs on the device's hardware
-encoder and the video is never uploaded to a server. The result can be shared
-straight to TikTok via the Web Share API, or saved.
+The home page is a mobile-first tool (Arabic, RTL) that prepares a video for TikTok
+in the browser. Nothing is uploaded to a server.
 
-Logic lives in `app/tiktok/encoder.ts`; the UI is `app/routes/home.tsx`.
+- **Max quality** (default): no re-encode. The recorded video and audio are copied
+  into an MP4 as they are (up to 4K / 60 fps, HDR kept), then the container's timing
+  headers are rewritten (`app/tiktok/container.ts`: the "120 FPS" timescale method
+  above 30 fps, the Silent Method otherwise).
+- **Lighter copy** (optional): an H.264 re-encode at most 1080p, kept only if smaller.
+- Optional copy without audio.
+
+The page then walks through uploading the file manually via TikTok Studio in the
+browser (the TikTok app re-compresses before uploading). Logic lives in
+`app/tiktok/encoder.ts`; the UI is `app/routes/home.tsx`.
