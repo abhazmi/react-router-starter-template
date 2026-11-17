@@ -1,13 +1,9 @@
-// Prepares a video for TikTok in the browser. Two outputs, mirroring what a
-// SHANAB MAX output file contains (our own implementation):
+// Prepares a video for TikTok in the browser. Two outputs:
 //
-// - "max": HEVC at a very high quality with the source's resolution, frame rate
-//   and timing, in a file laid out like an iPhone camera recording (see
-//   container.ts). Sources that are already HEVC (iPhone camera files, HDR) are
-//   copied without re-encoding. If this device can't encode HEVC, the original
-//   video is copied instead.
+// - "max": the FFmpeg + x265 CRF 18 command SHANAB MAX files are made with
+//   (see x265.ts). Slow, since x265 runs in WebAssembly, but high quality.
 // - "light": a smaller re-encoded copy (H.264, at most 1080p / 60 fps). It is a
-//   separate option, gets no container rewrite, and is refused if it isn't smaller.
+//   separate option, and is refused if it isn't smaller.
 //
 // Nothing is uploaded anywhere; all work happens on the device.
 
@@ -91,22 +87,25 @@ export type Result = {
   height: number;
   fps: number;
   codec: string;
-  hdr: boolean;
-  /** How the video track of a "max" output was made. */
-  video: "hevc" | "copy" | "light";
+  /** How the video was made: x265 in WebAssembly, or the lighter WebCodecs copy. */
+  video: "x265" | "light";
 };
 
 export type Job = { promise: Promise<Result>; cancel: () => void };
 
-/** x265 CRF 18 kept SHANAB's sample at ~89% of the source bitrate; use the same ratio. */
-const MAX_BITRATE_RATIO = 0.9;
-const MIN_MAX_BITRATE = 8_000_000;
-const MAX_MAX_BITRATE = 80_000_000;
-export const ENCODER_TAG = "TikTok HD";
+export type Phase = "loading" | "encoding";
 
 export class PrepareError extends Error {
   constructor(
-    public code: "NOT_ELIGIBLE" | "NO_ENCODER" | "UNDECODABLE" | "NOT_SMALLER" | "INVALID" | "CANCELED",
+    public code:
+      | "NOT_ELIGIBLE"
+      | "NO_ENCODER"
+      | "ENGINE_LOAD"
+      | "TOO_BIG"
+      | "UNDECODABLE"
+      | "NOT_SMALLER"
+      | "INVALID"
+      | "CANCELED",
     message?: string,
   ) {
     super(message ?? code);
@@ -121,83 +120,53 @@ export function prepareForTikTok(
   mode: Mode,
   opts: { mute: boolean },
   onProgress: (p: number) => void,
+  onPhase: (p: Phase) => void = () => {},
 ): Job {
+  if (mode === "max") return prepareMax(file, info, opts, onProgress, onPhase);
+
   let cancelRequested = false;
   let conversion: { cancel: () => Promise<void> } | null = null;
 
   const promise = (async (): Promise<Result> => {
     const mb = await import("mediabunny");
-    if (mode === "max") {
-      const e = maxEligibility(info);
-      if (!e.ok) throw new PrepareError("NOT_ELIGIBLE", e.reason);
-    } else if (!canMakeLight()) {
-      throw new PrepareError("NO_ENCODER");
-    }
+    if (!canMakeLight()) throw new PrepareError("NO_ENCODER");
 
     // The light copy: H.264 at most 1080p (short side) and 60 fps.
     const scale = Math.min(1, 1080 / Math.min(info.width, info.height));
-    const width = mode === "max" ? info.width : even(info.width * scale);
-    const height = mode === "max" ? info.height : even(info.height * scale);
-    const fps = mode === "max" ? exactFps(info.fps) : Math.min(60, Math.round(info.fps) || 30);
-
-    let codec: "avc" | "hevc" = "avc";
-    let quality = new mb.Quality("high");
-    let videoPlan: Result["video"] = "light";
-    if (mode === "light") {
-      const ok = async (c: "avc" | "hevc") => mb.canEncodeVideo(c, { width, height, quality, frameRate: fps });
-      if (await ok("avc")) codec = "avc";
-      else if (await ok("hevc")) codec = "hevc";
-      else throw new PrepareError("NO_ENCODER");
-    } else if (info.codec === "hevc") {
-      videoPlan = "copy";
-    } else {
-      // Re-encode to HEVC near the source bitrate, like SHANAB's x265 CRF 18 output.
-      const bitrate = Math.min(
-        MAX_MAX_BITRATE,
-        Math.max(MIN_MAX_BITRATE, Math.round(info.bitrate * MAX_BITRATE_RATIO)),
-      );
-      quality = new mb.Quality({ bitrate, bitrateMode: "variable" });
-      const canHevc =
-        canMakeLight() && (await mb.canEncodeVideo("hevc", { width, height, quality, frameRate: fps }));
-      videoPlan = canHevc ? "hevc" : "copy";
-      codec = "hevc";
-    }
-    if (videoPlan !== "copy" && !opts.mute && info.hasAudio && !(await mb.canEncodeAudio("aac"))) {
+    const width = even(info.width * scale);
+    const height = even(info.height * scale);
+    const fps = Math.min(60, Math.round(info.fps) || 30);
+    const quality = new mb.Quality("high");
+    const ok = async (c: "avc" | "hevc") => mb.canEncodeVideo(c, { width, height, quality, frameRate: fps });
+    let codec: "avc" | "hevc";
+    if (await ok("avc")) codec = "avc";
+    else if (await ok("hevc")) codec = "hevc";
+    else throw new PrepareError("NO_ENCODER");
+    if (!opts.mute && info.hasAudio && !(await mb.canEncodeAudio("aac"))) {
       const { registerAacEncoder } = await import("@mediabunny/aac-encoder");
       registerAacEncoder();
     }
     if (cancelRequested) throw new PrepareError("CANCELED");
+    onPhase("encoding");
 
     const input = new mb.Input({ source: new mb.BlobSource(file), formats: mb.ALL_FORMATS });
     const target = new mb.BufferTarget();
     const output = new mb.Output({ format: new mb.Mp4OutputFormat({ fastStart: "in-memory" }), target });
-
     try {
       const conv = await mb.Conversion.init({
         input,
         output,
         tracks: "primary",
-        video:
-          videoPlan === "copy"
-            ? {}
-            : videoPlan === "hevc"
-              ? {
-                  // Same size and timestamps as the source; keyframe every 250 frames like x265's default.
-                  codec: "hevc",
-                  quality,
-                  keyFrameInterval: 250 / fps,
-                  forceTranscode: true,
-                }
-              : {
-                  width,
-                  height,
-                  fit: "contain",
-                  frameRate: fps,
-                  codec,
-                  quality,
-                  forceTranscode: true,
-                  allowTransformationMetadata: false,
-                },
+        video: {
+          width,
+          height,
+          fit: "contain",
+          frameRate: fps,
+          codec,
+          quality,
+          forceTranscode: true,
+          allowTransformationMetadata: false,
+        },
         // AAC (what phones record) is copied; anything else becomes AAC.
         audio: opts.mute ? { discard: true } : { codec: "aac" },
         tags: {},
@@ -226,27 +195,14 @@ export function prepareForTikTok(
 
     const buffer = target.buffer;
     if (!buffer) throw new PrepareError("INVALID", "empty output");
-    let bytes: Uint8Array<ArrayBuffer> = new Uint8Array(buffer);
-
-    if (mode === "max") {
-      const { applyCameraStyle } = await import("./container");
-      try {
-        bytes = applyCameraStyle(bytes, ENCODER_TAG) as Uint8Array<ArrayBuffer>;
-      } catch (e) {
-        console.error(e);
-      }
-    } else if (bytes.length >= file.size) {
-      throw new PrepareError("NOT_SMALLER");
-    }
-
+    if (buffer.byteLength >= file.size) throw new PrepareError("NOT_SMALLER");
     return {
-      blob: new Blob([bytes], { type: "video/mp4" }),
+      blob: new Blob([buffer], { type: "video/mp4" }),
       width,
       height,
       fps,
-      codec: videoPlan === "copy" ? codecName(info.codec) : codecName(codec),
-      hdr: videoPlan === "copy" && info.hdr,
-      video: videoPlan,
+      codec: CODEC_NAMES[codec],
+      video: "light",
     };
   })();
 
@@ -255,6 +211,58 @@ export function prepareForTikTok(
     cancel: () => {
       cancelRequested = true;
       void conversion?.cancel();
+    },
+  };
+}
+
+function prepareMax(
+  file: File,
+  info: VideoInfo,
+  opts: { mute: boolean },
+  onProgress: (p: number) => void,
+  onPhase: (p: Phase) => void,
+): Job {
+  const e = maxEligibility(info);
+  if (!e.ok) {
+    return { promise: Promise.reject(new PrepareError("NOT_ELIGIBLE", e.reason)), cancel: () => {} };
+  }
+  let inner: { cancel: () => void } | null = null;
+  let canceled = false;
+  const promise = (async (): Promise<Result> => {
+    const { encodeX265, X265Error } = await import("./x265");
+    if (canceled) throw new PrepareError("CANCELED");
+    const job = encodeX265(
+      file,
+      { mute: opts.mute, duration: info.duration, expectedBytes: info.size },
+      onProgress,
+      onPhase,
+    );
+    inner = job;
+    try {
+      const bytes = await job.promise;
+      return {
+        blob: new Blob([bytes as Uint8Array<ArrayBuffer>], { type: "video/mp4" }),
+        width: info.width,
+        height: info.height,
+        fps: exactFps(info.fps),
+        codec: "HEVC (x265)",
+        video: "x265",
+      };
+    } catch (err) {
+      if (err instanceof X265Error) {
+        if (err.code === "CANCELED") throw new PrepareError("CANCELED");
+        if (err.code === "LOAD") throw new PrepareError("ENGINE_LOAD", err.message);
+        if (err.code === "NOT_ISOLATED" || err.code === "NO_MEMORY") throw new PrepareError("ENGINE_LOAD", err.code);
+        if (err.code === "TOO_BIG") throw new PrepareError("TOO_BIG", err.message);
+      }
+      throw new PrepareError("INVALID", String(err));
+    }
+  })();
+  return {
+    promise,
+    cancel: () => {
+      canceled = true;
+      inner?.cancel();
     },
   };
 }

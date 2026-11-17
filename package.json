@@ -15,6 +15,9 @@
     "publish": true
   },
   "dependencies": {
+    "@ffmpeg/core-mt": "0.12.10",
+    "@ffmpeg/ffmpeg": "0.12.15",
+    "@ffmpeg/util": "0.12.2",
     "@mediabunny/aac-encoder": "1.58.1",
     "isbot": "5.1.26",
     "mediabunny": "1.58.1",
@@ -42,7 +45,10 @@
     "deploy": "wrangler deploy",
     "dev": "react-router dev",
     "preview": "npm run build && vite preview",
-    "typecheck": "npm run typegen && tsc -b"
+    "typecheck": "npm run typegen && tsc -b",
+    "copy-ffmpeg": "node scripts/copy-ffmpeg.mjs",
+    "prebuild": "npm run copy-ffmpeg",
+    "predev": "npm run copy-ffmpeg"
   },
   "type": "module"
 }

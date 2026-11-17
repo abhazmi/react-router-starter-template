@@ -10,6 +10,7 @@ import {
   prepareForTikTok,
   readVideoInfo,
   type Job,
+  type Phase,
   type Result,
   type VideoInfo,
 } from "../tiktok/encoder";
@@ -30,7 +31,7 @@ type Stage =
   | { kind: "empty" }
   | { kind: "reading" }
   | { kind: "ready"; info: VideoInfo }
-  | { kind: "working"; info: VideoInfo; progress: number; startedAt: number }
+  | { kind: "working"; info: VideoInfo; progress: number; startedAt: number; phase: Phase }
   | { kind: "done"; info: VideoInfo; result: Result; url: string; seconds: number }
   | { kind: "error"; message: string; info?: VideoInfo };
 
@@ -57,6 +58,15 @@ export default function Home() {
     if (stage.kind !== "working") return;
     const t = setInterval(() => setNow(Date.now()), 500);
     return () => clearInterval(t);
+  }, [stage.kind]);
+
+  // Keep the screen on while working: phones pause the page when the screen locks.
+  useEffect(() => {
+    if (stage.kind !== "working") return;
+    let lock: { release: () => Promise<void> } | null = null;
+    const nav = navigator as Navigator & { wakeLock?: { request: (t: "screen") => Promise<typeof lock> } };
+    nav.wakeLock?.request("screen").then((l) => (lock = l)).catch(() => {});
+    return () => void lock?.release().catch(() => {});
   }, [stage.kind]);
 
   useEffect(() => {
@@ -87,9 +97,14 @@ export default function Home() {
     if (!file || !info) return;
     const startedAt = Date.now();
     setNow(startedAt);
-    setStage({ kind: "working", info, progress: 0, startedAt });
-    const job = prepareForTikTok(file, info, mode, { mute }, (progress) =>
-      setStage((s) => (s.kind === "working" ? { ...s, progress } : s)),
+    setStage({ kind: "working", info, progress: 0, startedAt, phase: "loading" });
+    const job = prepareForTikTok(
+      file,
+      info,
+      mode,
+      { mute },
+      (progress) => setStage((s) => (s.kind === "working" ? { ...s, progress } : s)),
+      (phase) => setStage((s) => (s.kind === "working" ? { ...s, phase } : s)),
     );
     jobRef.current = job;
     try {
@@ -108,6 +123,12 @@ export default function Home() {
       const message =
         code === "NOT_ELIGIBLE"
           ? (e as Error).message
+          : code === "ENGINE_LOAD"
+            ? (e as Error).message === "NO_MEMORY"
+              ? "جهازك ما سمح بالذاكرة اللي يحتاجها محرك الجودة القصوى. أغلق التطبيقات الثانية وجرّب، أو استخدم كمبيوتر."
+              : "ما قدرنا نحمّل محرك الجودة القصوى. حدّث الصفحة وتأكد من الإنترنت، وجرّب Safari أو Chrome محدّث."
+          : code === "TOO_BIG"
+            ? `المقطع كبير على ذاكرة جهازك (المتاح ${(e as Error).message} ميجا). قصّه لمقاطع أقصر أو استخدم كمبيوتر.`
           : code === "NO_ENCODER"
             ? "المتصفح هذا ما يقدر يسوي «نسخة أخف». افتح الصفحة في Safari أو Chrome محدّث."
             : code === "UNDECODABLE"
@@ -143,7 +164,7 @@ export default function Home() {
           <p className="text-xs font-semibold tracking-wider text-[#25f4ee]">استوديو الفيديو على جهازك</p>
           <h1 className="mt-1 text-3xl font-extrabold leading-tight">جودة مقطعك، مثل ما صوّرته.</h1>
           <p className="mt-2 text-sm leading-relaxed text-white/65">
-            جهّز مقطعك لتيك توك من المتصفح بصيغة HEVC بجودة عالية جدًا، بملف مثل ملفات كاميرا الآيفون،
+            جهّز مقطعك لتيك توك من المتصفح بترميز x265 (HEVC) بجودة عالية جدًا، بملف مثل ملفات كاميرا الآيفون،
             وبنفس الدقة (لين 4K) والفريمات (لين 60). الفيديو ما يطلع من جهازك.
           </p>
           <ol className="mt-4 grid grid-cols-3 gap-2 text-center text-xs text-white/70">
@@ -221,8 +242,9 @@ export default function Home() {
               <span className="rounded bg-[#25f4ee] px-1.5 py-0.5 text-[10px] text-black">الخيار الرئيسي</span>
             </p>
             <p className="mt-1 text-xs leading-relaxed text-white/65">
-              يحوّل الفيديو إلى HEVC بجودة عالية جدًا، بنفس الدقة والفريمات والتوقيت، داخل ملف مرتّب مثل
-              ملفات كاميرا الآيفون. إذا المقطع HEVC أصلًا (مثل تصوير الآيفون وHDR) ينسخه بدون إعادة ترميز.
+              يرمّز الفيديو بـ x265 بجودة CRF 18 (عالية جدًا)، بنفس الدقة والفريمات والتوقيت، داخل ملف مرتّب مثل
+              ملفات كاميرا الآيفون. <b>يأخذ وقت طويل</b>: تقريبًا 15 إلى 30 دقيقة لكل دقيقة فيديو حسب جهازك،
+              والكمبيوتر أسرع بكثير من الجوال.
               ما يكبّر مقطعًا أصغر إلى 4K.
             </p>
             <p
@@ -270,8 +292,17 @@ export default function Home() {
                 />
               </div>
               <div className="mt-2 flex justify-between text-sm text-white/70">
-                <span>{Math.round(stage.progress * 100)}%</span>
-                <span>{formatDuration((now - stage.startedAt) / 1000)}</span>
+                <span>
+                  {stage.phase === "loading"
+                    ? "نحمّل محرك الترميز (حوالي 30 ميجا، أول مرة بس)…"
+                    : `${Math.round(stage.progress * 100)}%`}
+                </span>
+                <span>
+                  {formatDuration((now - stage.startedAt) / 1000)}
+                  {stage.phase === "encoding" &&
+                    stage.progress > 0.02 &&
+                    ` · باقي تقريبًا ${formatDuration(((now - stage.startedAt) / 1000) * (1 / stage.progress - 1))}`}
+                </span>
               </div>
               <p className="mt-2 text-xs text-white/50">
                 لا تحدّث الصفحة، وخلّ الشاشة مفتوحة. الجوال ممكن يوقف المعالجة إذا قفلت الشاشة أو بدّلت
@@ -304,12 +335,7 @@ export default function Home() {
         {stage.kind === "done" && (
           <Card className="border-[#25f4ee]/40">
             <h2 className="mb-3 font-bold">✓ مقطعك جاهز للحفظ</h2>
-            {stage.result.video === "copy" && stage.info.codec !== "hevc" && (
-              <p className="mb-3 rounded-lg bg-yellow-400/10 p-2 text-xs leading-relaxed text-yellow-100">
-                جهازك أو متصفحك ما يدعم ترميز HEVC، فنسخنا الفيديو الأصلي بملف مثل ملفات الآيفون. للحصول على
-                HEVC افتح الصفحة في Safari على الآيفون أو الماك.
-              </p>
-            )}
+
             <video src={stage.url} controls playsInline className="max-h-[60vh] w-full rounded-xl bg-black" />
             <div className="mt-3 grid grid-cols-[1fr_auto_1fr] items-center gap-2 text-center text-xs">
               <div className="rounded-lg bg-white/5 p-2">
@@ -326,7 +352,6 @@ export default function Home() {
                 <p className="text-white/50">بعد</p>
                 <p dir="ltr">
                   {stage.result.width}×{stage.result.height} · {Math.round(stage.result.fps)}fps
-                  {stage.result.hdr && " · HDR"}
                 </p>
                 <p>
                   {stage.result.codec} · {formatBytes(stage.result.blob.size)}
@@ -443,7 +468,7 @@ export default function Home() {
               رفعت من المتصفح بدون مؤثرات أو صوت مضاف.
             </Faq>
             <Faq q="ألوان HDR تغيّرت">
-              مقاطع HDR من الآيفون تكون HEVC أصلًا، فالجودة القصوى تنسخها بدون تغيير. قارن المصدر والناتج على نفس
+              الجودة القصوى ترمّز الفيديو بنفس معلومات الألوان. قارن المصدر والناتج على نفس
               الشاشة ونفس المشغّل.
             </Faq>
             <Faq q="المعالجة بطيئة أو النسبة واقفة">
