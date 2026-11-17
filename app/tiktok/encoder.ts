@@ -3,7 +3,7 @@
 // 9:16-friendly resolution, constant frame rate, H.264 at a high bitrate, AAC audio.
 // Nothing is uploaded anywhere; all work happens on the device.
 
-export type PresetId = "1080p" | "2k" | "4k";
+export type PresetId = "original" | "1080p" | "2k" | "4k";
 
 export type Preset = {
   id: PresetId;
@@ -17,6 +17,15 @@ export type Preset = {
 };
 
 export const PRESETS: Preset[] = [
+  {
+    // Like SHANAB MAX: no re-encode, so resolution (up to 4K), frame rate and HDR stay as recorded.
+    id: "original",
+    label: "الأصلي بدون إعادة ترميز",
+    hint: "يحافظ على دقة المقطع وفريماته وألوان HDR مثل ما صوّرته، وهي نفس فكرة شنب. أسرع خيار.",
+    long: 0,
+    short: 0,
+    bitrate30: 0,
+  },
   {
     id: "1080p",
     label: "Full HD 1080p",
@@ -142,15 +151,28 @@ export function outputFrameRate(info: Pick<VideoInfo, "fps">, opts: Pick<EncodeO
   return opts.fps60 ? 60 : targetFrameRate(info.fps);
 }
 
+/** Turns 59.94 / 29.97-style rates into their exact NTSC values, as the 7-u8 patch does. */
+export function exactFps(fps: number) {
+  for (const base of [24, 30, 48, 60, 90, 120, 144, 240]) {
+    const ntsc = (base * 1000) / 1001;
+    if (Math.abs(fps - ntsc) < 0.01) return ntsc;
+    if (Math.abs(fps - base) < 0.01) return base;
+  }
+  return fps;
+}
+
 export function estimateBytes(
   info: VideoInfo,
   preset: Preset,
   opts: Pick<EncodeOptions, "fps60" | "cbr">,
 ) {
+  if (preset.id === "original") return info.bitrate * info.duration / 8;
   const fps = outputFrameRate(info, opts);
   const audio = info.hasAudio ? AUDIO_BITRATE : 0;
   return ((targetBitrate(preset, fps, opts.cbr) + audio) * info.duration) / 8;
 }
+
+const CODEC_NAMES: Record<string, string> = { avc: "H.264", hevc: "HEVC", vp9: "VP9", av1: "AV1" };
 
 export type EncodeResult = {
   blob: Blob;
@@ -197,31 +219,35 @@ export function encodeForTikTok(
       const { registerAacEncoder } = await import("@mediabunny/aac-encoder");
       registerAacEncoder();
     }
-    const { width, height } = targetSize(info, preset);
-    const fps = outputFrameRate(info, opts);
-    // Prefer the requested rate control; if the device can't do 50 Mbps CBR, use the preset VBR.
-    const qualities = [
-      ...(opts.cbr
-        ? [new mb.Quality({ bitrate: targetBitrate(preset, fps, true), bitrateMode: "constant" })]
-        : []),
-      new mb.Quality({ bitrate: targetBitrate(preset, fps), bitrateMode: "variable" }),
-    ];
-
-    // H.264 is what TikTok handles best; fall back to HEVC, then VP9, if the device can't do it at this size.
-    // The container rewrites only work on H.264.
+    const original = preset.id === "original";
+    const { width, height } = original ? info : targetSize(info, preset);
+    const fps = original ? exactFps(info.fps) : outputFrameRate(info, opts);
     let codec: "avc" | "hevc" | "vp9" | null = null;
-    let quality = qualities[0];
-    search: for (const q of qualities) {
-      for (const c of opts.method !== "none" ? (["avc"] as const) : (["avc", "hevc", "vp9"] as const)) {
-        if (await mb.canEncodeVideo(c, { width, height, quality: q, frameRate: fps })) {
-          codec = c;
-          quality = q;
-          break search;
+    let quality: InstanceType<typeof mb.Quality> | null = null;
+    let usedCbr = false;
+    if (!original) {
+      // Prefer the requested rate control; if the device can't do 50 Mbps CBR, use the preset VBR.
+      const qualities = [
+        ...(opts.cbr
+          ? [new mb.Quality({ bitrate: targetBitrate(preset, fps, true), bitrateMode: "constant" })]
+          : []),
+        new mb.Quality({ bitrate: targetBitrate(preset, fps), bitrateMode: "variable" }),
+      ];
+
+      // H.264 is what TikTok handles best; fall back to HEVC, then VP9, if the device can't do it at this size.
+      // The container rewrites only work on H.264.
+      search: for (const q of qualities) {
+        for (const c of opts.method !== "none" ? (["avc"] as const) : (["avc", "hevc", "vp9"] as const)) {
+          if (await mb.canEncodeVideo(c, { width, height, quality: q, frameRate: fps })) {
+            codec = c;
+            quality = q;
+            break search;
+          }
         }
       }
+      usedCbr = opts.cbr && quality === qualities[0];
+      if (!codec) throw new EncodeError(opts.method !== "none" ? "NO_H264" : "UNSUPPORTED_SIZE");
     }
-    const usedCbr = opts.cbr && quality === qualities[0];
-    if (!codec) throw new EncodeError(opts.method !== "none" ? "NO_H264" : "UNSUPPORTED_SIZE");
     if (cancelRequested) throw new EncodeError("CANCELED");
 
     const input = new mb.Input({ source: new mb.BlobSource(file), formats: mb.ALL_FORMATS });
@@ -236,19 +262,22 @@ export function encodeForTikTok(
         input,
         output,
         tracks: "primary",
-        video: {
-          width,
-          height,
-          fit: "contain",
-          frameRate: fps,
-          codec,
-          quality,
-          // Long GOP like the reference tool (keyframes roughly every 9 s).
-          keyFrameInterval: opts.method === "audio" ? 9.1 : 2,
-          forceTranscode: true,
-          // Bake rotation into the pixels so every app shows it upright.
-          allowTransformationMetadata: false,
-        },
+        // "original" copies the encoded video as is (only the container changes to MP4).
+        video: original
+          ? {}
+          : {
+              width,
+              height,
+              fit: "contain",
+              frameRate: fps,
+              codec: codec!,
+              quality: quality!,
+              // Long GOP like the reference tool (keyframes roughly every 9 s).
+              keyFrameInterval: opts.method === "audio" ? 9.1 : 2,
+              forceTranscode: true,
+              // Bake rotation into the pixels so every app shows it upright.
+              allowTransformationMetadata: false,
+            },
         // AAC sources (almost every phone video) are copied untouched; anything else becomes AAC.
         audio: { codec: "aac", quality: new mb.Quality({ bitrate: AUDIO_BITRATE }) },
         tags: {},
@@ -287,6 +316,8 @@ export function encodeForTikTok(
     let method = opts.method;
     if (method === "timescale" && fps <= 30) method = "silent";
     if (method === "audio" && !info.hasAudio) method = "frames";
+    // Ghost frames patch avcC, so they need H.264; other sources get the Silent Method instead.
+    if (method === "frames" && original && info.codec !== "avc") method = "silent";
     if (method !== "none") {
       const m = await import("./decoy");
       try {
@@ -311,7 +342,9 @@ export function encodeForTikTok(
       width,
       height,
       fps,
-      codec: { avc: "H.264", hevc: "HEVC", vp9: "VP9" }[codec],
+      codec: original
+        ? `${CODEC_NAMES[info.codec ?? ""] ?? info.codec ?? "?"} (بدون إعادة ترميز)`
+        : CODEC_NAMES[codec!],
     };
   })();
 

@@ -42,7 +42,7 @@ export default function Home() {
   const [supported, setSupported] = useState<boolean | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [stage, setStage] = useState<Stage>({ kind: "empty" });
-  const [presetId, setPresetId] = useState<PresetId>("1080p");
+  const [presetId, setPresetId] = useState<PresetId>("original");
   const [fps60, setFps60] = useState(true);
   const [method, setMethod] = useState<EncodeOptions["method"]>("timescale");
   const [cbr, setCbr] = useState(true);
@@ -190,12 +190,16 @@ export default function Home() {
             {file ? (
               <span className="block truncate text-sm">{file.name}</span>
             ) : (
-              <span className="text-base font-semibold">اضغط هنا واختر فيديو من الاستوديو</span>
+              <span className="text-base font-semibold">اضغط هنا واختر الفيديو من «الملفات»</span>
             )}
             <span className="mt-1 block text-xs text-white/50">
               {file ? "اضغط لتغيير الفيديو" : "MP4 · MOV · من الكاميرا أو أي تطبيق مونتاج"}
             </span>
           </button>
+          <p className="mt-2 rounded-lg bg-yellow-400/10 p-2 text-xs leading-relaxed text-yellow-100">
+            <b>مهم في الآيفون:</b> لا تختار من «الصور»، لأن الآيفون يضغط الفيديو ويحوّله لـ SDR قبل ما
+            يعطيه للصفحة. افتح المقطع في «الصور» ← مشاركة ← «حفظ في الملفات»، وبعدها اختره من «استعراض».
+          </p>
 
           {stage.kind === "reading" && (
             <p className="mt-3 text-center text-sm text-white/60">جاري قراءة الفيديو…</p>
@@ -209,7 +213,7 @@ export default function Home() {
               <Info label="الحجم" value={formatBytes(file.size)} />
             </dl>
           )}
-          {info?.hdr && (
+          {info?.hdr && presetId !== "original" && (
             <p className="mt-3 rounded-lg bg-yellow-400/10 p-3 text-xs leading-relaxed text-yellow-200">
               الفيديو مصوّر بـ HDR. تيك توك أحيانًا يعرض HDR بألوان باهتة، والأداة بتحوله لـ SDR.
               للحصول على أفضل ألوان، طفّ HDR من إعدادات الكاميرا قبل التصوير.
@@ -222,7 +226,7 @@ export default function Home() {
           <StepTitle n={2}>اختر الجودة</StepTitle>
           <div className="grid gap-2">
             {PRESETS.map((p) => {
-              const size = info ? targetSize(info, p) : null;
+              const size = info ? (p.id === "original" ? info : targetSize(info, p)) : null;
               return (
                 <label
                   key={p.id}
@@ -242,7 +246,7 @@ export default function Home() {
                   <span className="flex-1">
                     <span className="block font-semibold">
                       {p.label}
-                      {p.id === "1080p" && (
+                      {p.id === "original" && (
                         <span className="ms-2 rounded bg-[#fe2c55] px-1.5 py-0.5 text-[10px]">
                           موصى به
                         </span>
@@ -263,16 +267,16 @@ export default function Home() {
           <div className="mt-4 grid gap-2">
             <Toggle
               id="fps60"
-              checked={fps60}
-              disabled={busy}
+              checked={fps60 && presetId !== "original"}
+              disabled={busy || presetId === "original"}
               onChange={setFps60}
               title="60 فريم"
               hint="يطلع الفيديو 60fps حتى لو مصوّر 30، عشان تيك توك يعطيه جودة 1080p60."
             />
             <Toggle
               id="cbr"
-              checked={cbr}
-              disabled={busy}
+              checked={cbr && presetId !== "original"}
+              disabled={busy || presetId === "original"}
               onChange={setCbr}
               title="معدل بت ثابت 50 ميجابت"
               hint="نفس مواصفات الرفع في أداة أبو شداد (7-u8). يكبّر حجم الملف، بس يعطي تيك توك تفاصيل أكثر."
@@ -304,8 +308,9 @@ export default function Home() {
           </div>
           {info && (
             <p className="mt-3 text-xs text-white/50">
-              الإخراج: H.264 · {outputFrameRate(info, { fps60 })} fps ثابت
-              {cbr && " · 50 Mbps CBR"} · صوت AAC
+              {presetId === "original"
+                ? `الإخراج: نفس الفيديو بدون إعادة ترميز (${info.width}×${info.height} · ${Math.round(info.fps)} fps${info.hdr ? " · HDR" : ""})`
+                : `الإخراج: H.264 · ${outputFrameRate(info, { fps60 })} fps ثابت${cbr ? " · 50 Mbps CBR" : ""} · صوت AAC`}
               {method !== "none" && ` · ${METHODS.find((m) => m.id === method)!.short}`}
             </p>
           )}
@@ -371,7 +376,7 @@ export default function Home() {
               className="mx-auto max-h-[60vh] w-full rounded-xl bg-black"
             />
             <p className="mt-3 text-center text-xs text-white/60" dir="ltr">
-              {stage.result.width}×{stage.result.height} · {stage.result.fps} fps ·{" "}
+              {stage.result.width}×{stage.result.height} · {Math.round(stage.result.fps * 100) / 100} fps ·{" "}
               {stage.result.codec}
               {stage.result.cbr && " CBR"} · {formatBytes(stage.result.blob.size)} ·{" "}
               {formatDuration(stage.seconds)}
@@ -401,7 +406,10 @@ export default function Home() {
                   افتح <b dir="ltr">tiktok.com/tiktokstudio/upload</b>. على الآيفون: Safari ← زر «aA»
                   ← «طلب موقع سطح المكتب».
                 </li>
-                <li>ارفع الملف، وفعّل «Upload HD / جودة عالية» قبل النشر.</li>
+                <li>
+                  ارفع الملف، وخلّ «من يمكنه المشاهدة» على «الجميع»، وانشر مباشرة بدون ما تضيف صوت أو
+                  مؤثرات داخل تيك توك.
+                </li>
               </ol>
             </div>
 
