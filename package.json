@@ -48,7 +48,8 @@
     "typecheck": "npm run typegen && tsc -b",
     "copy-ffmpeg": "node scripts/copy-ffmpeg.mjs",
     "prebuild": "npm run copy-ffmpeg",
-    "predev": "npm run copy-ffmpeg"
+    "predev": "npm run copy-ffmpeg",
+    "build:static": "npm run copy-ffmpeg && vite build --config static-site/vite.config.ts && cp static-site/vercel.json static-site/dist/"
   },
   "type": "module"
 }

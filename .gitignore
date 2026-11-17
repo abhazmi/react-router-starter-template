@@ -204,3 +204,4 @@ dist
 
 # Copied from @ffmpeg/core by scripts/copy-ffmpeg.mjs
 /public/ffmpeg/
+/static-site/dist/
