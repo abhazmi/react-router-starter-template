@@ -1,10 +1,8 @@
-// MP4 container rewrites applied after the video is prepared. Only header and
-// sample-table fields change; the encoded video and audio samples are copied as is.
-//
-// - applyTimescale(): the community "120 FPS method" (ut0ku/120fps-method,
-//   EditingNews EN-TikTok-60FPS, 7-u8 TikTok-Quality-Toolkit).
-// - applySilent(): an independent implementation of the Silent Method as described
-//   in AscendedTweaks/silent-method's README.
+// Rewrites an MP4 produced in the browser so it is laid out like a file straight
+// from an iPhone camera, matching what SHANAB MAX output contains: QuickTime
+// brand, "Core Media" handler names, an nclc colour box plus a field box in the
+// video sample entry, a 600 movie timescale, and moov before mdat. Sample data
+// is copied untouched; only headers and chunk offsets change.
 
 const CONTAINERS = new Set(["moov", "trak", "mdia", "minf", "stbl", "edts", "dinf", "udta"]);
 
@@ -105,265 +103,187 @@ function readTable(b: Box, entryWords: number): number[][] {
   return rows;
 }
 
-function readSampleSizes(stsz: Box): number[] {
-  const fixed = u32(stsz.data, 4);
-  const count = u32(stsz.data, 8);
-  if (fixed) return new Array(count).fill(fixed);
-  return Array.from({ length: count }, (_, i) => u32(stsz.data, 12 + i * 4));
-}
-
 function tableBox(type: string, rows: number[][], prefix: number[] = []) {
   return { type, data: u32s(0, ...prefix, rows.length, ...rows.flat()) } satisfies Box;
 }
 
-// ---------------------------------------------------------------------------
-// "120 FPS method" (Oct 2026; ut0ku/120fps-method, EditingNews EN-TikTok-60FPS,
-// 7-u8 TikTok-Quality-Toolkit): scale the timescale and duration of mvhd and of
-// every mdhd by target/source fps. The declared length stays the same while the
-// frame rate implied by the sample durations drops to the target, so TikTok's
-// transcoder keeps the real frames. Only header fields change.
 
-function scaleHeader(b: Box, scale: number) {
-  const d = b.data.slice();
-  const dv = new DataView(d.buffer);
-  const v1 = d[0] === 1;
-  const tsAt = v1 ? 20 : 12;
-  const ts = dv.getUint32(tsAt);
-  const newTs = Math.round(ts * scale);
-  if (newTs < 1) throw new ContainerError(`timescale ${ts} cannot be scaled`);
-  dv.setUint32(tsAt, newTs);
-  if (v1) {
-    const dur = Number(dv.getBigUint64(tsAt + 4));
-    dv.setBigUint64(tsAt + 4, BigInt(Math.round(dur * scale)));
-  } else {
-    dv.setUint32(tsAt + 4, Math.round(dv.getUint32(tsAt + 4) * scale));
-  }
-  b.data = d;
+const enc = (s: string) => new TextEncoder().encode(s);
+
+function fullBox(type: string, flags: number, ...parts: Uint8Array[]) {
+  return box(type, u32s(flags & 0xffffff), ...parts);
 }
 
-export function applyTimescale(
-  input: Uint8Array,
-  fpsIn: number,
-  fpsOut = 30,
-): { bytes: Uint8Array; stats: { fpsIn: number; fpsOut: number } } {
-  if (fpsIn <= fpsOut) throw new ContainerError(`source fps ${fpsIn} must be above ${fpsOut}`);
-  const top = parseBoxes(input.slice(), 0, input.length);
-  const moov = top.find((b) => b.type === "moov");
-  if (!moov) throw new ContainerError("missing moov");
-  const traks = moov.children!.filter((b) => b.type === "trak");
-  if (!traks.some((t) => handlerOf(t) === "vide")) throw new ContainerError("no video track");
-  const scale = fpsOut / fpsIn;
-  scaleHeader(child(moov, "mvhd")!, scale);
-  for (const t of traks) scaleHeader(path(t, "mdia", "mdhd")!, scale);
-  // Header sizes are unchanged, so chunk offsets stay valid.
-  const parts = top.map(serialize);
-  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
-  let o = 0;
-  for (const part of parts) {
-    out.set(part, o);
-    o += part.length;
-  }
-  return { bytes: out, stats: { fpsIn, fpsOut } };
+/** QuickTime-style handler: component type + subtype, Pascal-string name (as iPhone files have). */
+function qtHandler(component: "mhlr" | "dhlr", subtype: string, name: string): Box {
+  const n = enc(name);
+  return { type: "hdlr", data: new Uint8Array([...u32s(0), ...enc(component), ...enc(subtype), ...new Uint8Array(12), n.length, ...n]) };
 }
 
-// ---------------------------------------------------------------------------
-// "Silent Method" (Nov 2026; AscendedTweaks/silent-method), reimplemented here
-// from its published description: moov before mdat, audio and video interleaved
-// per audio frame, fake 8-byte video samples in stsz/stco (not in stts, so players
-// ignore them) up to duration × 400, last video frame lasting 1 tick, btrt with
-// max = average bitrate, pasp 1:1, zeroed timestamps, and udta/meta removed.
+/** Stereo channel layout box (kAudioChannelLayoutTag_Stereo), as QuickTime writes in mp4a. */
+const CHAN_STEREO = new Uint8Array([0, 0, 0, 0, 0, 0x65, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
 
-const FAKE_PER_SEC = 400;
-const FAKE_SAMPLE = new Uint8Array([0, 0, 0, 4, 0, 0, 0, 0]);
-
-type TrackSamples = {
-  trak: Box;
-  isVideo: boolean;
-  timescale: number;
-  duration: number;
-  deltas: number[];
-  sizes: number[];
-  offsets: number[];
-  shift: number;
-  dts: number[];
-};
-
-function trackSamples(trak: Box): TrackSamples {
-  const stbl = path(trak, "mdia", "minf", "stbl")!;
-  const mdhd = path(trak, "mdia", "mdhd")!.data;
-  const v1 = mdhd[0] === 1;
-  const timescale = u32(mdhd, v1 ? 20 : 12);
-  const duration = v1 ? u32(mdhd, 24) * 2 ** 32 + u32(mdhd, 28) : u32(mdhd, 16);
-  const deltas = readTable(child(stbl, "stts")!, 2).flatMap(([n, d]) => new Array(n).fill(d));
-  const sizes = readSampleSizes(child(stbl, "stsz")!).slice(0, deltas.length);
-  const stco = child(stbl, "stco");
-  if (!stco) throw new ContainerError("64-bit offsets not supported");
-  const chunks = readTable(stco, 1).map((r) => r[0]);
-  const stsc = readTable(child(stbl, "stsc")!, 3);
-  if (u32(child(stbl, "stsd")!.data, 4) !== 1) throw new ContainerError("multiple sample descriptions");
-
-  const offsets: number[] = [];
-  for (let c = 0, e = 0; c < chunks.length && offsets.length < sizes.length; c++) {
-    while (e + 1 < stsc.length && stsc[e + 1][0] <= c + 1) e++;
-    let o = chunks[c];
-    for (let k = 0; k < stsc[e][1] && offsets.length < sizes.length; k++) {
-      offsets.push(o);
-      o += sizes[offsets.length - 1];
-    }
-  }
-
-  // Media time of the first non-empty edit, so both tracks line up on the timeline.
-  let shift = 0;
-  const elst = path(trak, "edts", "elst");
-  if (elst) {
-    const dv = new DataView(elst.data.buffer, elst.data.byteOffset, elst.data.byteLength);
-    const n = u32(elst.data, 4);
-    for (let k = 0; k < n; k++) {
-      const t = elst.data[0] === 1 ? Number(dv.getBigInt64(16 + 20 * k)) : dv.getInt32(12 + 12 * k);
-      if (t !== -1) {
-        shift = t;
-        break;
-      }
-    }
-  }
-  const dts: number[] = [];
-  deltas.reduce((t, d) => (dts.push(t), t + d), 0);
-  return { trak, isVideo: handlerOf(trak) === "vide", timescale, duration, deltas, sizes, offsets, shift, dts };
-}
-
-function runLength(values: number[]): number[][] {
-  const out: number[][] = [];
-  for (const v of values) {
-    const last = out.at(-1);
-    if (last && last[1] === v) last[0]++;
-    else out.push([1, v]);
-  }
-  return out;
-}
-
-/** Rewrites the video sample entry so it carries pasp (1:1 unless present) and btrt (max = avg). */
-function patchVisualEntry(stsd: Box, avgBitrate: number) {
+/** Replaces btrt with a chan box in a stereo mp4a entry. */
+function cameraAudioEntry(stsd: Box) {
   const d = stsd.data;
   const entrySize = u32(d, 8);
-  const entryType = type4(d, 12);
-  const fixed = d.subarray(16, 16 + 78); // VisualSampleEntry fields before the child boxes
-  const kids = parseBoxes(d, 16 + 78, 8 + entrySize);
-  const pasp = kids.find((k) => k.type === "pasp")?.data ?? u32s(1, 1);
-  const rest = kids.filter((k) => k.type !== "pasp" && k.type !== "btrt").map(serialize);
-  const entry = box(entryType, fixed, ...rest, box("pasp", pasp), box("btrt", u32s(0, avgBitrate, avgBitrate)));
+  if (type4(d, 12) !== "mp4a" || d[16 + 8] !== 0 || d[16 + 9] !== 0) return; // only v0 sound entries
+  const channels = (d[16 + 16] << 8) | d[16 + 17];
+  const fixed = d.subarray(16, 16 + 28);
+  const kids = parseBoxes(d, 16 + 28, 8 + entrySize).filter((k) => k.type !== "btrt" && k.type !== "chan");
+  const extra = channels === 2 ? [box("chan", CHAN_STEREO)] : [];
+  const entry = box("mp4a", fixed, ...kids.map(serialize), ...extra);
   stsd.data = new Uint8Array([...d.subarray(0, 8), ...entry]);
 }
 
-function zeroBoxTimes(b: Box) {
-  const d = b.data.slice();
-  d.fill(0, 4, d[0] === 1 ? 20 : 12);
-  b.data = d;
+/** stbl children in the order QuickTime writes them. */
+const STBL_ORDER = ["stsd", "stts", "ctts", "stss", "sdtp", "stsc", "stsz", "stco", "sgpd", "sbgp"];
+
+/** Keeps the codec config box and adds QuickTime-style fiel + nclc colr, as iPhone files have. */
+function cameraVisualEntry(stsd: Box) {
+  const d = stsd.data;
+  const entrySize = u32(d, 8);
+  const entryType = type4(d, 12);
+  const fixed = d.subarray(16, 16 + 78);
+  const kids = parseBoxes(d, 16 + 78, 8 + entrySize);
+  const config = kids.filter((k) => k.type === "hvcC" || k.type === "avcC").map(serialize);
+  let primaries = 1, transfer = 1, matrix = 1;
+  const colr = kids.find((k) => k.type === "colr");
+  if (colr && colr.data.length >= 10) {
+    const v = new DataView(colr.data.buffer, colr.data.byteOffset, colr.data.byteLength);
+    primaries = v.getUint16(4);
+    transfer = v.getUint16(6);
+    matrix = v.getUint16(8);
+  }
+  const fiel = box("fiel", new Uint8Array([1, 0]));
+  const nclc = new Uint8Array(10);
+  nclc.set(enc("nclc"));
+  const nv = new DataView(nclc.buffer);
+  nv.setUint16(4, primaries);
+  nv.setUint16(6, transfer);
+  nv.setUint16(8, matrix);
+  const entry = box(entryType, fixed, ...config, fiel, box("colr", nclc));
+  stsd.data = new Uint8Array([...d.subarray(0, 8), ...entry]);
 }
 
-export function applySilent(input: Uint8Array): {
-  bytes: Uint8Array;
-  stats: { frames: number; fakes: number };
-} {
+/** Converts a media timescale to 600 when every sample duration divides exactly. */
+function mediaTo600(mdhd: Box, stbl: Box) {
+  const d = mdhd.data;
+  if (d[0] !== 0) return;
+  const ts = u32(d, 12);
+  if (ts === 600) return;
+  const stts = child(stbl, "stts");
+  if (!stts) return;
+  const rows = readTable(stts, 2);
+  const ok = (n: number) => (n * 600) % ts === 0;
+  const ctts = child(stbl, "ctts");
+  const cttsRows = ctts ? readTable(ctts, 2) : [];
+  if (!rows.every(([, delta]) => ok(delta)) || !cttsRows.every(([, off]) => ok(off))) return;
+  const out = d.slice();
+  const v = new DataView(out.buffer);
+  v.setUint32(12, 600);
+  v.setUint32(16, Math.round((u32(d, 16) * 600) / ts));
+  mdhd.data = out;
+  Object.assign(stts, tableBox("stts", rows.map(([n, delta]) => [n, (delta * 600) / ts])));
+  if (ctts) Object.assign(ctts, tableBox("ctts", cttsRows.map(([n, off]) => [n, (off * 600) / ts])));
+}
+
+/** Rescales a movie-timescale duration field (u32 at `at` in a v0 box). */
+function scaleU32(b: Box, at: number, scale: number) {
+  const out = b.data.slice();
+  new DataView(out.buffer).setUint32(at, Math.round(u32(out, at) * scale));
+  b.data = out;
+}
+
+function shiftChunkOffsets(b: Box, delta: number): Box {
+  if (b.type === "stco") return tableBox("stco", readTable(b, 1).map(([o]) => [o + delta]));
+  return b.children ? { ...b, children: b.children.map((c) => shiftChunkOffsets(c, delta)) } : b;
+}
+
+export function applyCameraStyle(input: Uint8Array, encoderTag: string): Uint8Array {
   const file = input.slice();
   const top = parseBoxes(file, 0, file.length);
-  if (top.some((b) => b.type === "moof")) throw new ContainerError("fragmented MP4 not supported");
-  const ftyp = top.find((b) => b.type === "ftyp");
   const moov = top.find((b) => b.type === "moov");
-  if (!ftyp || !moov) throw new ContainerError("missing ftyp/moov");
+  const mdat = top.find((b) => b.type === "mdat");
+  if (!moov || !mdat) throw new ContainerError("missing moov/mdat");
   const traks = moov.children!.filter((b) => b.type === "trak");
-  const tracks = traks.map(trackSamples);
-  const vIndex = tracks.findIndex((t) => t.isVideo);
-  if (vIndex < 0) throw new ContainerError("no video track");
-  const video = tracks[vIndex];
-
-  // Order every sample by presentation time; video first on ties.
-  const events: { i: number; s: number; t: number }[] = [];
-  tracks.forEach((tr, i) =>
-    tr.dts.forEach((d, s) => events.push({ i, s, t: (d - tr.shift) / tr.timescale })),
-  );
-  events.sort((a, b) => a.t - b.t || +(a.i !== vIndex) - +(b.i !== vIndex) || a.i - b.i || a.s - b.s);
-
-  // Consecutive video frames share a chunk; each audio frame is its own chunk.
-  const chunks: { i: number; samples: number[] }[] = [];
-  for (const { i, s } of events) {
-    const last = chunks.at(-1);
-    if (last && last.i === i && i === vIndex) last.samples.push(s);
-    else chunks.push({ i, samples: [s] });
+  if (traks.some((t) => path(t, "mdia", "minf", "stbl", "co64"))) {
+    throw new ContainerError("64-bit offsets not supported");
   }
-  const layout = tracks.map(() => [] as { rel: number; count: number }[]);
-  let rel = 0;
-  for (const c of chunks) {
-    layout[c.i].push({ rel, count: c.samples.length });
-    for (const s of c.samples) rel += tracks[c.i].sizes[s];
+
+  // Movie timescale 600, like iPhone files; durations in movie units follow.
+  const mvhd = child(moov, "mvhd")!;
+  if (mvhd.data[0] !== 0) throw new ContainerError("mvhd v1 not supported");
+  const movieScale = 600 / u32(mvhd.data, 12);
+  if (movieScale !== 1) {
+    const out = mvhd.data.slice();
+    new DataView(out.buffer).setUint32(12, 600);
+    mvhd.data = out;
+    scaleU32(mvhd, 16, movieScale);
   }
-  const fakes = Math.max(0, Math.round((video.duration * FAKE_PER_SEC) / video.timescale) - video.sizes.length);
-  const fakeRel = rel;
-  for (let k = 0; k < fakes; k++) layout[vIndex].push({ rel: fakeRel, count: 1 });
 
-  const avg = Math.floor(
-    (video.sizes.reduce((a, b) => a + b, 0) * 8 * video.timescale) / Math.max(1, video.duration),
-  );
-
-  // Rewrite each track's sample tables; offsets are filled in once moov's size is known.
-  const setOffsets = (base: number) =>
-    tracks.forEach((tr, i) => {
-      const stbl = path(tr.trak, "mdia", "minf", "stbl")!;
-      const set = (t: string, b: Box) => {
-        const at = stbl.children!.findIndex((c) => c.type === t);
-        stbl.children![at] = b;
-      };
-      set("stco", tableBox("stco", layout[i].map((l) => [base + l.rel])));
-    });
-  tracks.forEach((tr, i) => {
-    const stbl = path(tr.trak, "mdia", "minf", "stbl")!;
-    const isV = i === vIndex;
-    const sizes = isV ? [...tr.sizes, ...new Array(fakes).fill(FAKE_SAMPLE.length)] : tr.sizes;
-    const firstFake = isV ? layout[i].length - fakes : -1;
-    const stsc: number[][] = [];
-    layout[i].forEach((l, k) => {
-      const last = stsc.at(-1);
-      if (!last || last[1] !== l.count || k === firstFake) stsc.push([k + 1, l.count, 1]);
-    });
-    stbl.children = stbl.children!.map((c) => {
-      if (c.type === "stsz") return { type: "stsz", data: u32s(0, 0, sizes.length, ...sizes) };
-      if (c.type === "stsc") return tableBox("stsc", stsc);
-      if (c.type === "stts" && isV) {
-        return tableBox("stts", runLength([...tr.deltas.slice(0, -1), 1]));
+  const movieDuration = u32(mvhd.data, 16);
+  for (const t of traks) {
+    const kind = handlerOf(t);
+    const mdia = child(t, "mdia")!;
+    const minf = child(mdia, "minf")!;
+    const name = kind === "vide" ? "Core Media Video" : kind === "soun" ? "Core Media Audio" : "";
+    mdia.children = mdia.children!.map((c) => (c.type === "hdlr" && name ? qtHandler("mhlr", kind, name) : c));
+    // vmhd/smhd, then a data handler, then dinf and stbl.
+    const header = minf.children!.filter((c) => c.type === "vmhd" || c.type === "smhd");
+    const rest = minf.children!.filter((c) => !["vmhd", "smhd", "hdlr"].includes(c.type));
+    minf.children = [...header, qtHandler("dhlr", "url ", "DataHandler"), ...rest];
+    const tkhd = child(t, "tkhd");
+    if (tkhd && tkhd.data[0] === 0 && movieScale !== 1) scaleU32(tkhd, 20, movieScale);
+    const elst = path(t, "edts", "elst");
+    if (elst && elst.data[0] === 0 && movieScale !== 1) {
+      for (let k = 0; k < u32(elst.data, 4); k++) scaleU32(elst, 8 + 12 * k, movieScale);
+    }
+    // The video track gets an edit list covering it (in 600 units), as camera files have.
+    if (kind === "vide" && !elst) {
+      const duration = tkhd && tkhd.data[0] === 0 ? u32(tkhd.data, 20) : movieDuration;
+      const edit: Box = { type: "elst", data: u32s(0, 1, duration, 0, 0x00010000) };
+      const at = t.children!.findIndex((c) => c.type === "tkhd") + 1;
+      t.children!.splice(at, 0, { type: "edts", data: new Uint8Array(), children: [edit] });
+    }
+    const stbl = path(t, "mdia", "minf", "stbl");
+    if (stbl) {
+      if (kind === "vide") {
+        cameraVisualEntry(child(stbl, "stsd")!);
+        mediaTo600(path(t, "mdia", "mdhd")!, stbl);
       }
-      if (c.type === "stsd" && isV) patchVisualEntry(c, avg);
-      return c;
-    });
-  });
-
-  // Zero timestamps and drop editor metadata.
-  const strip = (b: Box): Box => {
-    if (["mvhd", "tkhd", "mdhd"].includes(b.type)) zeroBoxTimes(b);
-    if (!b.children || b.type === "stbl") return b;
-    return { ...b, children: b.children.filter((c) => c.type !== "udta" && c.type !== "meta").map(strip) };
-  };
-  const newMoov = strip(moov);
-
-  const head = new Uint8Array([...serialize(ftyp), ...box("free")]);
-  setOffsets(0);
-  const base = head.length + serialize(newMoov).length + 8;
-  setOffsets(base);
-  const moovBytes = serialize(newMoov);
-
-  const payload = new Uint8Array(rel + FAKE_SAMPLE.length);
-  let o = 0;
-  for (const c of chunks) {
-    const tr = tracks[c.i];
-    for (const s of c.samples) {
-      payload.set(file.subarray(tr.offsets[s], tr.offsets[s] + tr.sizes[s]), o);
-      o += tr.sizes[s];
+      if (kind === "soun") cameraAudioEntry(child(stbl, "stsd")!);
+      const rank = (b: Box) => (STBL_ORDER.indexOf(b.type) + 100) % 100;
+      stbl.children = [...stbl.children!].sort((a, b) => rank(a) - rank(b));
     }
   }
-  payload.set(FAKE_SAMPLE, o);
-  const mdat = box("mdat", payload);
 
-  const out = new Uint8Array(head.length + moovBytes.length + mdat.length);
-  out.set(head);
-  out.set(moovBytes, head.length);
-  out.set(mdat, head.length + moovBytes.length);
-  return { bytes: out, stats: { frames: video.sizes.length, fakes } };
+  const ilst = box("ilst", (() => {
+    const data = box("data", u32s(1, 0), enc(encoderTag));
+    const w = new Writer();
+    w.u32(8 + data.length);
+    w.bytes(new Uint8Array([0xa9, 0x74, 0x6f, 0x6f])); // ©too
+    w.bytes(data);
+    return w.done();
+  })());
+  const meta = fullBox("meta", 0, fullBox("hdlr", 0, u32s(0), enc("mdir"), new Uint8Array(13)), ilst);
+  moov.children = moov.children!.filter((b) => b.type !== "udta" && b.type !== "meta");
+  moov.children.push({ type: "udta", data: new Uint8Array(), children: [{ type: "meta", data: meta.subarray(8) }] });
+
+  const ftyp = box("ftyp", enc("qt  "), u32s(512), enc("qt  "));
+  const free = box("free");
+  const oldDataStart = mdat.data.byteOffset - file.byteOffset;
+  const moovSize = serialize(moov).length;
+  const newDataStart = ftyp.length + moovSize + free.length + 8;
+  const moovBytes = serialize(shiftChunkOffsets(moov, newDataStart - oldDataStart));
+  if (moovBytes.length !== moovSize) throw new ContainerError("moov size changed");
+  const mdatBytes = box("mdat", mdat.data);
+
+  const out = new Uint8Array(ftyp.length + moovBytes.length + free.length + mdatBytes.length);
+  let o = 0;
+  for (const part of [ftyp, moovBytes, free, mdatBytes]) {
+    out.set(part, o);
+    o += part.length;
+  }
+  return out;
 }

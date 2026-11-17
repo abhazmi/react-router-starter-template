@@ -1,9 +1,11 @@
-// Prepares a video for TikTok in the browser. Two outputs, mirroring the flow
-// SHANAB MAX describes (our own implementation):
+// Prepares a video for TikTok in the browser. Two outputs, mirroring what a
+// SHANAB MAX output file contains (our own implementation):
 //
-// - "max": no re-encode. The recorded video and audio are copied into an MP4 as
-//   they are (resolution up to 4K, frame rate up to 60, HDR kept), then the
-//   container's timing headers are rewritten (see container.ts).
+// - "max": HEVC at a very high quality with the source's resolution, frame rate
+//   and timing, in a file laid out like an iPhone camera recording (see
+//   container.ts). Sources that are already HEVC (iPhone camera files, HDR) are
+//   copied without re-encoding. If this device can't encode HEVC, the original
+//   video is copied instead.
 // - "light": a smaller re-encoded copy (H.264, at most 1080p / 60 fps). It is a
 //   separate option, gets no container rewrite, and is refused if it isn't smaller.
 //
@@ -58,11 +60,8 @@ export async function readVideoInfo(file: File): Promise<VideoInfo> {
   }
 }
 
-/** Whether the no-re-encode output can be made from this source. */
+/** Whether the max-quality output can be made from this source. */
 export function maxEligibility(info: VideoInfo): Eligibility {
-  if (info.codec !== "avc" && info.codec !== "hevc") {
-    return { ok: false, reason: `صيغة الفيديو (${codecName(info.codec)}) ما تنفع بدون تحويل. جرّب «نسخة أخف».` };
-  }
   const long = Math.max(info.width, info.height);
   const short = Math.min(info.width, info.height);
   if (long > 3840 || short > 2160) return { ok: false, reason: "الدقة أعلى من 4K. جرّب «نسخة أخف»." };
@@ -93,11 +92,17 @@ export type Result = {
   fps: number;
   codec: string;
   hdr: boolean;
-  /** Container rewrite applied to a "max" output. */
-  patch: "timescale" | "silent" | "none";
+  /** How the video track of a "max" output was made. */
+  video: "hevc" | "copy" | "light";
 };
 
 export type Job = { promise: Promise<Result>; cancel: () => void };
+
+/** x265 CRF 18 kept SHANAB's sample at ~89% of the source bitrate; use the same ratio. */
+const MAX_BITRATE_RATIO = 0.9;
+const MIN_MAX_BITRATE = 8_000_000;
+const MAX_MAX_BITRATE = 80_000_000;
+export const ENCODER_TAG = "TikTok HD";
 
 export class PrepareError extends Error {
   constructor(
@@ -136,16 +141,30 @@ export function prepareForTikTok(
     const fps = mode === "max" ? exactFps(info.fps) : Math.min(60, Math.round(info.fps) || 30);
 
     let codec: "avc" | "hevc" = "avc";
-    const quality = new mb.Quality("high");
+    let quality = new mb.Quality("high");
+    let videoPlan: Result["video"] = "light";
     if (mode === "light") {
       const ok = async (c: "avc" | "hevc") => mb.canEncodeVideo(c, { width, height, quality, frameRate: fps });
       if (await ok("avc")) codec = "avc";
       else if (await ok("hevc")) codec = "hevc";
       else throw new PrepareError("NO_ENCODER");
-      if (!opts.mute && info.hasAudio && !(await mb.canEncodeAudio("aac"))) {
-        const { registerAacEncoder } = await import("@mediabunny/aac-encoder");
-        registerAacEncoder();
-      }
+    } else if (info.codec === "hevc") {
+      videoPlan = "copy";
+    } else {
+      // Re-encode to HEVC near the source bitrate, like SHANAB's x265 CRF 18 output.
+      const bitrate = Math.min(
+        MAX_MAX_BITRATE,
+        Math.max(MIN_MAX_BITRATE, Math.round(info.bitrate * MAX_BITRATE_RATIO)),
+      );
+      quality = new mb.Quality({ bitrate, bitrateMode: "variable" });
+      const canHevc =
+        canMakeLight() && (await mb.canEncodeVideo("hevc", { width, height, quality, frameRate: fps }));
+      videoPlan = canHevc ? "hevc" : "copy";
+      codec = "hevc";
+    }
+    if (videoPlan !== "copy" && !opts.mute && info.hasAudio && !(await mb.canEncodeAudio("aac"))) {
+      const { registerAacEncoder } = await import("@mediabunny/aac-encoder");
+      registerAacEncoder();
     }
     if (cancelRequested) throw new PrepareError("CANCELED");
 
@@ -158,20 +177,27 @@ export function prepareForTikTok(
         input,
         output,
         tracks: "primary",
-        // "max" copies the encoded video untouched; only the container becomes MP4.
         video:
-          mode === "max"
+          videoPlan === "copy"
             ? {}
-            : {
-                width,
-                height,
-                fit: "contain",
-                frameRate: fps,
-                codec,
-                quality,
-                forceTranscode: true,
-                allowTransformationMetadata: false,
-              },
+            : videoPlan === "hevc"
+              ? {
+                  // Same size and timestamps as the source; keyframe every 250 frames like x265's default.
+                  codec: "hevc",
+                  quality,
+                  keyFrameInterval: 250 / fps,
+                  forceTranscode: true,
+                }
+              : {
+                  width,
+                  height,
+                  fit: "contain",
+                  frameRate: fps,
+                  codec,
+                  quality,
+                  forceTranscode: true,
+                  allowTransformationMetadata: false,
+                },
         // AAC (what phones record) is copied; anything else becomes AAC.
         audio: opts.mute ? { discard: true } : { codec: "aac" },
         tags: {},
@@ -202,15 +228,10 @@ export function prepareForTikTok(
     if (!buffer) throw new PrepareError("INVALID", "empty output");
     let bytes: Uint8Array<ArrayBuffer> = new Uint8Array(buffer);
 
-    let patch: Result["patch"] = "none";
     if (mode === "max") {
-      // Above 30 fps: declare 30 fps via the timing headers. At 30 fps or below
-      // there is nothing to scale, so use the Silent Method instead.
-      const c = await import("./container");
+      const { applyCameraStyle } = await import("./container");
       try {
-        const r = fps > 30.5 ? c.applyTimescale(bytes, fps, 30) : c.applySilent(bytes);
-        bytes = r.bytes as Uint8Array<ArrayBuffer>;
-        patch = fps > 30.5 ? "timescale" : "silent";
+        bytes = applyCameraStyle(bytes, ENCODER_TAG) as Uint8Array<ArrayBuffer>;
       } catch (e) {
         console.error(e);
       }
@@ -223,9 +244,9 @@ export function prepareForTikTok(
       width,
       height,
       fps,
-      codec: mode === "max" ? codecName(info.codec) : codecName(codec),
-      hdr: mode === "max" && info.hdr,
-      patch,
+      codec: videoPlan === "copy" ? codecName(info.codec) : codecName(codec),
+      hdr: videoPlan === "copy" && info.hdr,
+      video: videoPlan,
     };
   })();
 

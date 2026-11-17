@@ -143,8 +143,8 @@ export default function Home() {
           <p className="text-xs font-semibold tracking-wider text-[#25f4ee]">استوديو الفيديو على جهازك</p>
           <h1 className="mt-1 text-3xl font-extrabold leading-tight">جودة مقطعك، مثل ما صوّرته.</h1>
           <p className="mt-2 text-sm leading-relaxed text-white/65">
-            جهّز مقطعك لتيك توك من المتصفح بدون إعادة ترميز: نفس الدقة (لين 4K) ونفس الفريمات (لين 60)
-            وألوان HDR. الفيديو ما يطلع من جهازك.
+            جهّز مقطعك لتيك توك من المتصفح بصيغة HEVC بجودة عالية جدًا، بملف مثل ملفات كاميرا الآيفون،
+            وبنفس الدقة (لين 4K) والفريمات (لين 60). الفيديو ما يطلع من جهازك.
           </p>
           <ol className="mt-4 grid grid-cols-3 gap-2 text-center text-xs text-white/70">
             {["اختر مقطعك من «الملفات»", "نفحص توافقه", "احفظه وارفعه من المتصفح"].map((t, i) => (
@@ -221,8 +221,9 @@ export default function Home() {
               <span className="rounded bg-[#25f4ee] px-1.5 py-0.5 text-[10px] text-black">الخيار الرئيسي</span>
             </p>
             <p className="mt-1 text-xs leading-relaxed text-white/65">
-              بدون إعادة ترميز: تبقى الدقة والفريمات وألوان HDR مثل الأصل، ونعدّل بيانات التوقيت في الملف
-              عشان تيك توك يحافظ على الفريمات. ما يكبّر مقطعًا أصغر إلى 4K.
+              يحوّل الفيديو إلى HEVC بجودة عالية جدًا، بنفس الدقة والفريمات والتوقيت، داخل ملف مرتّب مثل
+              ملفات كاميرا الآيفون. إذا المقطع HEVC أصلًا (مثل تصوير الآيفون وHDR) ينسخه بدون إعادة ترميز.
+              ما يكبّر مقطعًا أصغر إلى 4K.
             </p>
             <p
               className={`mt-2 text-xs font-semibold ${
@@ -303,6 +304,12 @@ export default function Home() {
         {stage.kind === "done" && (
           <Card className="border-[#25f4ee]/40">
             <h2 className="mb-3 font-bold">✓ مقطعك جاهز للحفظ</h2>
+            {stage.result.video === "copy" && stage.info.codec !== "hevc" && (
+              <p className="mb-3 rounded-lg bg-yellow-400/10 p-2 text-xs leading-relaxed text-yellow-100">
+                جهازك أو متصفحك ما يدعم ترميز HEVC، فنسخنا الفيديو الأصلي بملف مثل ملفات الآيفون. للحصول على
+                HEVC افتح الصفحة في Safari على الآيفون أو الماك.
+              </p>
+            )}
             <video src={stage.url} controls playsInline className="max-h-[60vh] w-full rounded-xl bg-black" />
             <div className="mt-3 grid grid-cols-[1fr_auto_1fr] items-center gap-2 text-center text-xs">
               <div className="rounded-lg bg-white/5 p-2">
@@ -420,7 +427,7 @@ export default function Home() {
           </a>
           <p className="mt-3 text-[11px] leading-relaxed text-white/45">
             إكمال الرفع ما يضمن الدقة اللي بيعرضها تيك توك للمشاهدين، لأن تيك توك يعالج المقطع بعد الرفع.
-            تعديل بيانات التوقيت حيلة غير رسمية، ممكن تيك توك يوقفها في أي وقت.
+            ترتيب الملف مثل ملفات الآيفون طريقة غير رسمية، وتيك توك ممكن يغيّر طريقة معالجته في أي وقت.
           </p>
         </Card>
 
@@ -428,15 +435,16 @@ export default function Home() {
         <Card>
           <h2 className="mb-2 font-bold">مشاكل شائعة</h2>
           <div className="divide-y divide-white/10 text-sm">
-            <Faq q="المدة صارت 0:00، أو تيك توك يقول المقطع أطول من 60 دقيقة">
-              افتح الملف المحفوظ وتأكد من مدته. إذا المدة غلط لا ترفعه، وجرّب مرة ثانية من المقطع الأصلي.
+            <Faq q="الملف ما يشتغل أو مدته غلط">
+              افتح الملف المحفوظ وتأكد من مدته وصورته. إذا فيه مشكلة لا ترفعه، وجرّب مرة ثانية من المقطع الأصلي.
             </Faq>
             <Faq q="الملف 4K بس تيك توك ما يعرض 4K">
               الجودة القصوى تحافظ على دقة المصدر، بس اللي يعرضه تيك توك يعتمد على معالجته بعد الرفع. تأكد إنك
               رفعت من المتصفح بدون مؤثرات أو صوت مضاف.
             </Faq>
             <Faq q="ألوان HDR تغيّرت">
-              قارن المصدر والناتج على نفس الشاشة ونفس المشغّل. الجودة القصوى ما تغيّر ألوان الفيديو.
+              مقاطع HDR من الآيفون تكون HEVC أصلًا، فالجودة القصوى تنسخها بدون تغيير. قارن المصدر والناتج على نفس
+              الشاشة ونفس المشغّل.
             </Faq>
             <Faq q="المعالجة بطيئة أو النسبة واقفة">
               خلّ المتصفح قدام والشاشة مفتوحة، وأغلق التبويبات الثانية، وجرّب مقطعًا أقصر.
