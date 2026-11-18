@@ -107,3 +107,19 @@ This template comes with [Tailwind CSS](https://tailwindcss.com/) already config
 ---
 
 Built with ❤️ using React Router.
+
+## TikTok HD tool (`/`)
+
+The home page is a mobile-first tool (Arabic, RTL) that prepares a video for TikTok
+in the browser. Nothing is uploaded to a server.
+
+- **Max quality** (default): no re-encode. The recorded video and audio are copied
+  into an MP4 as they are (up to 4K / 60 fps, HDR kept), then the container's timing
+  headers are rewritten (`app/tiktok/container.ts`: the "120 FPS" timescale method
+  above 30 fps, the Silent Method otherwise).
+- **Lighter copy** (optional): an H.264 re-encode at most 1080p, kept only if smaller.
+- Optional copy without audio.
+
+The page then walks through uploading the file manually via TikTok Studio in the
+browser (the TikTok app re-compresses before uploading). Logic lives in
+`app/tiktok/encoder.ts`; the UI is `app/routes/home.tsx`.
