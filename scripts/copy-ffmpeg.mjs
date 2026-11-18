@@ -7,9 +7,9 @@
 // its build, so the engine fits in a phone's memory:
 //   1. ffmpeg-core.wasm: the shared-memory import minimum is lowered from
 //      16384 pages (1 GiB) to 2048 pages (128 MiB); the maximum is unchanged.
-//   2. ffmpeg-core.js: the pthread pool starts with 4 workers instead of 32, and
-//      the memory size is read from a "mem" query parameter (MiB) on the core's
-//      URL, so the page can pick a size the device can allocate (default 1024).
+//   2. ffmpeg-core.js: the pthread pool size and the memory size are read from
+//      "pool" and "mem" query parameters on the core's URL (defaults: 4 workers,
+//      like SHANAB, and 1024 MiB), so the page can size both for the device.
 // Codec code is unchanged. The upstream package is
 // https://registry.npmjs.org/@ffmpeg/core-mt/-/core-mt-0.12.10.tgz
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -66,7 +66,7 @@ writeFileSync(join(dest, "ffmpeg-core.wasm"), wasm);
 // 2. Smaller pthread pool; memory size from the core URL's "mem" parameter.
 let js = readFileSync(join(src, "ffmpeg-core.js"), "utf8");
 const swaps = [
-  ["pthreadPoolSize=32", "pthreadPoolSize=4"],
+  ["pthreadPoolSize=32", 'pthreadPoolSize=(+new URL(import.meta.url).searchParams.get("pool")||4)'],
   [
     'INITIAL_MEMORY=Module["INITIAL_MEMORY"]||1073741824',
     'INITIAL_MEMORY=Module["INITIAL_MEMORY"]||(+new URL(import.meta.url).searchParams.get("mem")||1024)*1048576',
